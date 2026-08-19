@@ -91,7 +91,7 @@ ever visible, which is the outcome you wanted.
 npm install cache-fence redis
 ```
 
-Node.js >= 20. `redis` (node-redis) `>=5.0.0 <7` is an **optional** peer dependency — bring your own client, or
+Node.js >= 22. `redis` (node-redis) `>=5.0.0 <7` is an **optional** peer dependency — bring your own client, or
 adapt another one through the five-method interface in [Redis client adapter](#redis-client-adapter).
 cache-fence itself has no runtime dependencies.
 
@@ -146,7 +146,7 @@ npm test          # requires Docker: spins up a real Redis via testcontainers
 2. It runs the **same interleaving** through cache-fence and asserts the write was rejected: the compare-and-set
    returns 0, the key stays absent, and the next read recomputes.
 
-No mocked Redis, no mocked Lua. CI runs the suite on Node 20, 22 and 24.
+No mocked Redis, no mocked Lua. CI runs the suite on Node 22 and 24.
 
 ## API reference
 
