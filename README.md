@@ -146,7 +146,7 @@ npm test          # requires Docker: spins up a real Redis via testcontainers
 2. It runs the **same interleaving** through cache-fence and asserts the write was rejected: the compare-and-set
    returns 0, the key stays absent, and the next read recomputes.
 
-No mocked Redis, no mocked Lua. CI runs the suite on Node 22 and 24.
+No mocked Redis, no mocked Lua.
 
 ## API reference
 
@@ -208,6 +208,9 @@ immediately while a fenced background refresh runs → otherwise run `loader` �
 - **With SWR**, the background refresh reuses the generation captured when the serving request started, so a
   refresh spanning an invalidation is rejected too. Refreshes are deduplicated per key, so they cannot stack, and
   the stale entry is only written when the fresh write was accepted.
+- **No cancellation or timeout contract.** The loader runs to completion — there is no `AbortSignal` support,
+  and concurrent callers joined to a flight share its outcome. If the computation needs a deadline, enforce it
+  inside the loader.
 
 ### `get<T>(key): Promise<T | undefined>`
 
@@ -274,6 +277,14 @@ const adapter: RedisCommands = {
 
 `scanIterator` may yield single keys or batches; both are handled.
 
+On a Redis Cluster, four of the five operations route themselves: `get` and `incr` are single-key, `eval`
+follows its first key (and both keys the script touches share the `{namespace}` hash tag), and `unlink` only
+ever receives keys from one namespace, hence one slot. The one operation that needs cluster-specific work is
+`scanIterator`: SCAN cursors are per-node state, so the adapter must walk every master and drain each node's
+iterator in turn — scanning a single node would silently leave stale keys on the other masters during an
+invalidation sweep. [`test/cluster-fixture.ts`](test/cluster-fixture.ts) contains a complete node-redis
+cluster adapter following this pattern.
+
 ## Failure semantics: fail-closed
 
 When Redis is unreachable, the correct answer is a slow answer, not a fast wrong one. `getOrCompute` degrades to
@@ -315,8 +326,10 @@ Two consequences worth stating explicitly:
 - **Redis-only, by design.** The guarantee is server-side atomicity via Lua. A generic storage adapter cannot
   promise that, so there isn't one.
 - **Redis Cluster**: the counter and the data keys share the `{namespace}` hash tag, so they land in the same
-  slot and the Lua script never hits `CROSSSLOT`. Cluster is designed for, not yet covered by tests — see
-  [Status](#status-and-roadmap).
+  slot and the compare-and-set never hits `CROSSSLOT`. The test suite verifies this against a live three-master
+  cluster — including a `CROSSSLOT` negative control and a cross-master invalidation sweep
+  (`CLUSTER_TESTS=1 npm run test:cluster`). Failover, resharding and replica reads are not covered. The cluster
+  `scanIterator` adapter pattern is described in [Redis client adapter](#redis-client-adapter).
 - **One generation per namespace.** Invalidation is namespace-wide by construction. Use narrower namespaces for
   narrower blast radius.
 - **In-process single-flight.** Deduplicates within one process. Cross-process stampede control is not this
@@ -337,20 +350,41 @@ Node.
 cache-fence packages that mechanism for Redis and Node, with an explicit compare-and-set API rather than an
 implicit one.
 
-## Status and roadmap
+## Performance
 
-**v0.1.0, pre-1.0.** The API surface is deliberately small, but it may still change before 1.0.
+The price of the guarantee, measured (`node bench/run.mjs`: Redis 7 in local Docker, sequential operations on
+one connection — absolute numbers are dominated by loopback round-trip time and vary by machine; the ratios
+are the signal):
+
+| operation | p50 µs | mean µs | vs unfenced (p50) |
+| --- | ---: | ---: | ---: |
+| `setIfGeneration` (fenced write, Lua CAS) | 89.6 | 91.9 | +5.6% |
+| plain `SET` with TTL (baseline) | 84.8 | 87.5 | — |
+| `getOrCompute` cache hit (2 round trips) | 164.0 | 168.9 | +100.4% |
+| raw `GET` (baseline, 1 round trip) | 81.8 | 84.3 | — |
+
+- A fenced write stays one round trip: the ~6% is the Lua interpreter plus a server-side counter `GET`.
+- A fenced cache hit pays a second round trip for the generation read — the design cost of the guarantee,
+  roughly 2× a raw `GET` on loopback.
+- Invalidating a 10,000-key namespace takes ~10 ms (~1M keys/s). Note that `SCAN` traverses the whole
+  keyspace, not just the namespace, so sweep time scales with total database size.
+
+Methodology, caveats and reproduction: [bench/](bench/).
+
+## Status
+
+**v0.1.x, pre-1.0.** The API surface is deliberately small, but it may still change before 1.0.
 
 The fencing mechanism is derived from a pattern running in a production backend; this *package* is new, and does
-not yet have a production track record of its own. What can be checked today is the guarantee itself: it is
-exercised against a real Redis server via testcontainers, in CI, on every push.
+not yet have a production track record of its own. What can be checked today is the guarantee itself: every
+claim in this README is exercised by the test suite against a real Redis server — and a real Redis Cluster.
 
-Roadmap:
+Known limitations:
 
-- Benchmarks: fenced write vs plain `SET` (one Lua round trip), and invalidation sweep cost at scale. The price
-  of correctness should be a number, not an adjective.
-- Integration examples: plain node-redis, alongside cache-manager, and NestJS.
-- Redis Cluster test coverage, to turn the hash-tag design from reasoned into verified.
+- `getOrCompute` has no cancellation or timeout contract: the loader can run unboundedly, there is no
+  `AbortSignal`, and concurrent callers joined to a flight share its outcome.
+- Cluster failover, resharding and replica reads are untested — see
+  [Design constraints](#design-constraints-and-what-this-is-not).
 
 Issues and PRs are welcome, particularly reproductions of stale resurrection in real systems.
 

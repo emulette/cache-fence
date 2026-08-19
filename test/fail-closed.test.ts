@@ -1,9 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import {
-  createFencedCache,
-  type FencedCacheErrorEvent,
-  type RedisCommands,
-} from '../src/index';
+import { createFencedCache, type FencedCacheErrorEvent, type RedisCommands } from '../src/index';
 
 const NAMESPACE = 'catalog';
 const KEY = 'works';
@@ -136,9 +132,9 @@ describe('fail-closed behaviour when Redis misbehaves', () => {
       namespace: NAMESPACE,
       onError: (event) => events.push(event),
     });
-    await expect(
-      writeBroken.setIfGeneration(KEY, 'computed', 0, { ttlMs: TTL_MS }),
-    ).rejects.toBe(REDIS_DOWN);
+    await expect(writeBroken.setIfGeneration(KEY, 'computed', 0, { ttlMs: TTL_MS })).rejects.toBe(
+      REDIS_DOWN,
+    );
 
     const counterBroken = createFencedCache({
       redis: createStubRedis().commands,

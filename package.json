@@ -1,6 +1,6 @@
 {
   "name": "cache-fence",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Generation-fenced Redis cache: atomically rejects stale writes that cross an invalidation",
   "license": "MIT OR Apache-2.0",
   "type": "module",
@@ -44,6 +44,10 @@
     "build": "tsdown",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:cluster": "CLUSTER_TESTS=1 vitest run test/cluster.test.ts",
+    "test:consumer": "node scripts/consumer-test.mjs",
+    "lint": "biome check .",
+    "format": "biome format --write .",
     "prepublishOnly": "npm run typecheck && npm run build"
   },
   "peerDependencies": {
@@ -63,9 +67,11 @@
     "url": "https://github.com/emulette/cache-fence/issues"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.5.9",
     "@testcontainers/redis": "^12.1.0",
     "@types/node": "^26.2.0",
     "redis": "^6.2.1",
+    "testcontainers": "^12.1.0",
     "tsdown": "^0.22.14",
     "typescript": "^7.0.2",
     "vitest": "^4.1.11"

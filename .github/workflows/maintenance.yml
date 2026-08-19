@@ -1,0 +1,72 @@
+name: Maintenance
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Every Monday at 03:00 UTC.
+    - cron: '0 3 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+
+  peer-floor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Installs the lowest version allowed by the `redis` peer range, without
+      # touching the lockfile, so the suite runs against the floor we advertise.
+      - name: Install redis peer-range floor
+        run: npm install --no-save redis@5.0.0
+
+      - name: Test against the peer-range floor
+        run: npm test
+
+  latest-range:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Moves the working copy's lockfile to the latest version allowed by each
+      # dependency's declared range, without committing the result.
+      - name: Update to the latest in-range dependencies
+        run: npm update
+
+      - name: Test against the latest in-range dependencies
+        run: npm test

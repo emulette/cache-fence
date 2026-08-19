@@ -121,21 +121,21 @@ describe('serialization and input validation', () => {
   it('rejects a ttl that is not a positive whole number of milliseconds', async () => {
     const cache = createFencedCache({ redis: fx.commands, namespace: NAMESPACE });
 
-    await expect(
-      cache.getOrCompute(KEY, async () => WORK, { ttlMs: 0 }),
-    ).rejects.toThrow(FENCED_CACHE_ERRORS.invalidTtl('ttlMs', 0));
-    await expect(
-      cache.getOrCompute(KEY, async () => WORK, { ttlMs: -1 }),
-    ).rejects.toThrow(FENCED_CACHE_ERRORS.invalidTtl('ttlMs', -1));
-    await expect(
-      cache.getOrCompute(KEY, async () => WORK, { ttlMs: 1.5 }),
-    ).rejects.toThrow(FENCED_CACHE_ERRORS.invalidTtl('ttlMs', 1.5));
+    await expect(cache.getOrCompute(KEY, async () => WORK, { ttlMs: 0 })).rejects.toThrow(
+      FENCED_CACHE_ERRORS.invalidTtl('ttlMs', 0),
+    );
+    await expect(cache.getOrCompute(KEY, async () => WORK, { ttlMs: -1 })).rejects.toThrow(
+      FENCED_CACHE_ERRORS.invalidTtl('ttlMs', -1),
+    );
+    await expect(cache.getOrCompute(KEY, async () => WORK, { ttlMs: 1.5 })).rejects.toThrow(
+      FENCED_CACHE_ERRORS.invalidTtl('ttlMs', 1.5),
+    );
     await expect(
       cache.getOrCompute(KEY, async () => WORK, { ttlMs: TTL_MS, staleTtlMs: 0 }),
     ).rejects.toThrow(FENCED_CACHE_ERRORS.invalidTtl('staleTtlMs', 0));
-    await expect(
-      cache.setIfGeneration(KEY, WORK, 0, { ttlMs: -1 }),
-    ).rejects.toThrow(FENCED_CACHE_ERRORS.invalidTtl('ttlMs', -1));
+    await expect(cache.setIfGeneration(KEY, WORK, 0, { ttlMs: -1 })).rejects.toThrow(
+      FENCED_CACHE_ERRORS.invalidTtl('ttlMs', -1),
+    );
 
     expect(await cache.get(KEY)).toBeUndefined();
   });

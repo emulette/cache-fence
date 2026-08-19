@@ -109,9 +109,7 @@ export class FencedCache {
     if (options.staleTtlMs !== undefined) {
       assertTtl('staleTtlMs', options.staleTtlMs);
     }
-    return this.computeFlights.run(this.freshKey(key), () =>
-      this.compute(key, loader, options),
-    );
+    return this.computeFlights.run(this.freshKey(key), () => this.compute(key, loader, options));
   }
 
   /** Reads the fresh entry for `key`. `undefined` means a miss; a cached `null` stays `null`. */

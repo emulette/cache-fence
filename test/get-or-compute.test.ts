@@ -1,12 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createFencedCache, type FencedCache, type RedisCommands } from '../src/index';
-import {
-  deferred,
-  poll,
-  startRedisFixture,
-  storageKeys,
-  type RedisFixture,
-} from './redis-fixture';
+import { deferred, poll, startRedisFixture, storageKeys, type RedisFixture } from './redis-fixture';
 
 const NAMESPACE = 'catalog';
 const KEY = 'works';
