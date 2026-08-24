@@ -66,7 +66,7 @@ jobs:
       # Moves the working copy's lockfile to the latest version allowed by each
       # dependency's declared range, without committing the result.
       - name: Update to the latest in-range dependencies
-        run: npm update
+        run: npm exec --yes --package=npm@11.17.0 -c 'npm update'
 
       - name: Test against the latest in-range dependencies
         run: npm test
