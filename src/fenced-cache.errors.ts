@@ -4,6 +4,7 @@ export const FENCED_CACHE_ERRORS = {
     `namespace must be a non-empty string without "*", "{" or "}", received: ${String(namespace)}`,
   invalidGeneration: (raw: string): string =>
     `generation counter holds a non-integer value: "${raw}"`,
+  invalidReadReply: (): string => 'Redis returned an invalid cache snapshot',
   invalidTtl: (option: string, value: unknown): string =>
     `${option} must be a positive integer number of milliseconds, received: ${String(value)}`,
   unserializableValue: (): string =>

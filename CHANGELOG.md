@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-08
+
+### Fixed
+
+- Escape namespace characters in invalidation scan patterns so `?`, brackets and
+  backslashes cannot delete another namespace's keys or leave their own keys behind.
+- Scope foreground computations and SWR refreshes by generation. Requests after
+  invalidation no longer join pre-invalidation work, including invalidation by another instance.
+
+### Added
+
+- Optional `onEvent` callback and exported `FencedCacheEvent` union for hits, misses,
+  fence rejections and completed refreshes. Observer exceptions do not affect cache operations.
+
+### Changed
+
+- Read the generation and fresh/stale entry atomically in one Lua command, reducing
+  cache-hit reads to one Redis round trip while preserving cache failure handling.
+- Malformed snapshot responses bypass caching and report through `onError`.
+- Consumer packaging checks now exercise both ESM and CJS against a real Redis server.
+- Update benchmarks and API documentation for the new read path and event semantics.
+
 ## [0.1.1] - 2026-08-19
 
 ### Added

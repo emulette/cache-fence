@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { createFencedCache, type FencedCacheErrorEvent, type RedisCommands } from '../src/index';
+import {
+  createFencedCache,
+  FENCED_CACHE_ERRORS,
+  type FencedCacheErrorEvent,
+  type RedisCommands,
+} from '../src/index';
 
 const NAMESPACE = 'catalog';
 const KEY = 'works';
@@ -8,15 +13,11 @@ const TTL_MS = 60_000;
 /** Stands in for a Redis that is down, unreachable or refusing the command. */
 const REDIS_DOWN = new Error('the connection to Redis is closed');
 
-/** The counter key sits outside the data prefix, which is how a stub tells them apart. */
-function isCounterKey(key: string): boolean {
-  return key.endsWith(':gen');
-}
-
 interface StubRedisOptions {
   get?: (key: string) => Promise<string | null>;
   incr?: () => Promise<number>;
   eval?: () => Promise<unknown>;
+  read?: () => Promise<unknown>;
 }
 
 interface StubRedis {
@@ -31,7 +32,10 @@ function createStubRedis(options: StubRedisOptions = {}): StubRedis {
   const commands: RedisCommands = {
     get: options.get ?? (() => Promise.reject(REDIS_DOWN)),
     incr: options.incr ?? (() => Promise.reject(REDIS_DOWN)),
-    eval: () => {
+    eval: (_script, { arguments: args }) => {
+      if (args.length === 0) {
+        return options.read === undefined ? Promise.reject(REDIS_DOWN) : options.read();
+      }
       evalCalls += 1;
       return options.eval === undefined ? Promise.reject(REDIS_DOWN) : options.eval();
     },
@@ -91,7 +95,7 @@ describe('fail-closed behaviour when Redis misbehaves', () => {
   });
 
   it('reports a broken write path as a setIfGeneration error and still returns the value', async () => {
-    const stub = createStubRedis({ get: () => Promise.resolve(null) });
+    const stub = createStubRedis({ read: () => Promise.resolve(['0', 'miss', '']) });
     const cache = createFencedCache({
       redis: stub.commands,
       namespace: NAMESPACE,
@@ -109,7 +113,7 @@ describe('fail-closed behaviour when Redis misbehaves', () => {
 
   it('skips the write entirely when the cache read fails after the generation was captured', async () => {
     const stub = createStubRedis({
-      get: (key) => (isCounterKey(key) ? Promise.resolve('7') : Promise.reject(REDIS_DOWN)),
+      read: () => Promise.resolve(['7', 'freshError', REDIS_DOWN.message]),
     });
     const cache = createFencedCache({
       redis: stub.commands,
@@ -148,9 +152,26 @@ describe('fail-closed behaviour when Redis misbehaves', () => {
     expect(events).toEqual([]);
   });
 
+  it('bypasses caching when the snapshot response is malformed', async () => {
+    const stub = createStubRedis({ read: () => Promise.resolve(['0', 'fresh', 42]) });
+    const cache = createFencedCache({
+      redis: stub.commands,
+      namespace: NAMESPACE,
+      onError: (event) => events.push(event),
+    });
+
+    expect(await cache.getOrCompute(KEY, async () => 'computed', { ttlMs: TTL_MS })).toBe(
+      'computed',
+    );
+    expect(stub.evalCalls()).toBe(0);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.operation).toBe('generation');
+    expect(String(events[0]?.error)).toContain(FENCED_CACHE_ERRORS.invalidReadReply());
+  });
+
   it('survives an onError handler that throws, without leaking an unhandled rejection', async () => {
     const handlerFailure = new Error('the error handler itself is broken');
-    const stub = createStubRedis({ get: () => Promise.resolve(null) });
+    const stub = createStubRedis({ read: () => Promise.resolve(['0', 'miss', '']) });
     const cache = createFencedCache({
       redis: stub.commands,
       namespace: NAMESPACE,

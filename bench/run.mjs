@@ -213,9 +213,9 @@ async function benchFencedWrite({ createFencedCache, commands, client }) {
 /**
  * 2. getOrCompute hit path vs raw GET.
  *
- * The hit path is generation GET + data GET, so it pays two round trips where an
- * unfenced cache pays one. The baseline deserializes too, so the delta is the
- * extra round trip plus single-flight bookkeeping, not JSON.
+ * The hit path reads the generation and data atomically in one EVAL round trip.
+ * The baseline deserializes too, so the delta is server-side scripting and snapshot
+ * decoding, not an extra round trip or JSON.
  */
 async function benchReadHit({ createFencedCache, commands, client }) {
   await client.flushAll();
@@ -260,7 +260,7 @@ async function benchReadHit({ createFencedCache, commands, client }) {
   section(
     `2. getOrCompute cache hit vs raw GET (N=${READ_OPS.toLocaleString('en-US')}, warmup ${READ_WARMUP}, loader never ran)`,
     table(LATENCY_HEADERS, [
-      latencyRow('getOrCompute hit (fenced, 2 round trips)', hit),
+      latencyRow('getOrCompute hit (fenced, 1 round trip)', hit),
       latencyRow('GET + JSON.parse (unfenced, 1 round trip)', raw),
       deltaRow('fencing delta', hit, raw),
     ]) + DELTA_LEGEND,

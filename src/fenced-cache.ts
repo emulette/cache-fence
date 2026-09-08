@@ -2,6 +2,7 @@ import { FENCED_CACHE_ERRORS } from './fenced-cache.errors';
 import { SingleFlight } from './single-flight';
 import type {
   FencedCacheErrorEvent,
+  FencedCacheEvent,
   FencedCacheOptions,
   GetOrComputeOptions,
   InvalidationResult,
@@ -26,6 +27,28 @@ redis.call('SET', KEYS[2], ARGV[2], 'PX', ARGV[3])
 return 1
 `;
 
+/** Capture the generation and the first available entry in one atomic round trip. */
+const READ_SCRIPT = `
+local generation = redis.call('GET', KEYS[1]) or '0'
+local fresh = redis.pcall('GET', KEYS[2])
+if type(fresh) == 'table' then
+  return {generation, 'freshError', fresh.err}
+end
+if fresh ~= false then
+  return {generation, 'fresh', fresh}
+end
+if #KEYS == 3 then
+  local stale = redis.pcall('GET', KEYS[3])
+  if type(stale) == 'table' then
+    return {generation, 'staleError', stale.err}
+  end
+  if stale ~= false then
+    return {generation, 'stale', stale}
+  end
+end
+return {generation, 'miss', ''}
+`;
+
 const DEFAULT_SCAN_COUNT = 1000;
 const DEFAULT_UNLINK_BATCH_SIZE = 1000;
 
@@ -44,6 +67,16 @@ const JSON_SERIALIZER: Serializer = {
 };
 
 type CacheEntry = { hit: true; value: unknown } | { hit: false };
+type ReadStatus = 'fresh' | 'stale' | 'miss' | 'freshError' | 'staleError';
+type CacheSnapshot = { generation: number; status: ReadStatus; raw: string };
+
+function parseGeneration(raw: string): number {
+  const parsed = Number(raw);
+  if (raw.trim() === '' || !Number.isSafeInteger(parsed)) {
+    throw new Error(FENCED_CACHE_ERRORS.invalidGeneration(raw));
+  }
+  return parsed;
+}
 
 function assertNamespace(namespace: string): void {
   if (typeof namespace !== 'string' || namespace.length === 0 || /[*{}]/.test(namespace)) {
@@ -73,6 +106,7 @@ export class FencedCache {
   private readonly unlinkBatchSize: number;
   private readonly serializer: Serializer;
   private readonly onError?: (event: FencedCacheErrorEvent) => void;
+  private readonly onEvent?: (event: FencedCacheEvent) => void;
   private readonly computeFlights = new SingleFlight();
   private readonly refreshFlights = new SingleFlight();
 
@@ -87,6 +121,7 @@ export class FencedCache {
     this.unlinkBatchSize = options.unlinkBatchSize ?? DEFAULT_UNLINK_BATCH_SIZE;
     this.serializer = options.serializer ?? JSON_SERIALIZER;
     this.onError = options.onError;
+    this.onEvent = options.onEvent;
   }
 
   /**
@@ -95,7 +130,7 @@ export class FencedCache {
    *
    * The generation is captured before any cache read, so an invalidation that lands
    * while `loader` runs causes the write-back to be rejected instead of resurrecting
-   * stale data. Concurrent callers for the same key share one computation.
+   * stale data. Concurrent callers for the same key and generation share one computation.
    *
    * Only `loader` failures reach the caller. Cache failures are reported through
    * `onError` and degrade to computing the value without caching it.
@@ -109,7 +144,7 @@ export class FencedCache {
     if (options.staleTtlMs !== undefined) {
       assertTtl('staleTtlMs', options.staleTtlMs);
     }
-    return this.computeFlights.run(this.freshKey(key), () => this.compute(key, loader, options));
+    return this.compute(key, loader, options);
   }
 
   /** Reads the fresh entry for `key`. `undefined` means a miss; a cached `null` stays `null`. */
@@ -134,20 +169,13 @@ export class FencedCache {
   ): Promise<boolean> {
     assertTtl('ttlMs', options.ttlMs);
     const raw = this.serializer.serialize(value);
-    return this.fencedSet(this.freshKey(key), raw, generation, options.ttlMs);
+    return this.fencedSet(key, 'fresh', raw, generation, options.ttlMs);
   }
 
   /** Current generation of the namespace. An untouched namespace is at generation 0. */
   async generation(): Promise<number> {
     const raw = await this.redis.get(this.counterKey);
-    if (raw === null) {
-      return 0;
-    }
-    const parsed = Number(raw);
-    if (raw.trim() === '' || !Number.isSafeInteger(parsed)) {
-      throw new Error(FENCED_CACHE_ERRORS.invalidGeneration(raw));
-    }
-    return parsed;
+    return raw === null ? 0 : parseGeneration(raw);
   }
 
   /** Advances the generation, invalidating every write captured before this call. */
@@ -174,47 +202,45 @@ export class FencedCache {
     loader: () => Promise<T>,
     options: GetOrComputeOptions,
   ): Promise<T> {
-    let generation: number;
+    let snapshot: CacheSnapshot;
     try {
-      generation = await this.generation();
+      snapshot = await this.readSnapshot(key, options.staleTtlMs !== undefined);
     } catch (error) {
       // Without a generation no write can be fenced, so the cache is bypassed entirely.
       this.emitError({ operation: 'generation', key, error });
       return loader();
     }
 
-    let cacheReachable = true;
-    try {
-      const fresh = await this.readEntry(this.freshKey(key));
-      if (fresh.hit) {
-        return fresh.value as T;
-      }
-    } catch (error) {
-      this.emitError({ operation: 'get', key, error });
-      cacheReachable = false;
-    }
-
-    if (cacheReachable && options.staleTtlMs !== undefined) {
+    const { generation, status, raw } = snapshot;
+    let cacheReachable = status !== 'freshError';
+    if (status === 'freshError' || status === 'staleError') {
+      this.emitError({ operation: 'get', key, error: new Error(raw) });
+    } else if (status === 'fresh' || status === 'stale') {
       try {
-        const stale = await this.readEntry(this.staleKey(key));
-        if (stale.hit) {
+        const value = this.serializer.deserialize(raw) as T;
+        this.emitEvent({ type: 'hit', key, source: status });
+        if (status === 'stale') {
           this.startRefresh(key, loader, generation, options);
-          return stale.value as T;
         }
+        return value;
       } catch (error) {
         this.emitError({ operation: 'get', key, error });
+        cacheReachable = status !== 'fresh';
       }
     }
 
-    const value = await loader();
-    if (cacheReachable) {
-      await this.writeBack(key, value, generation, options);
-    }
-    return value;
+    this.emitEvent({ type: 'miss', key });
+    return this.computeFlights.run(this.flightKey(key, generation), async () => {
+      const value = await loader();
+      if (cacheReachable) {
+        await this.writeBack(key, value, generation, options);
+      }
+      return value;
+    });
   }
 
   /**
-   * Fire-and-forget stale-while-revalidate refresh, deduplicated so refreshes cannot stack.
+   * Fire-and-forget stale-while-revalidate refresh, deduplicated per key and generation.
    *
    * Failures are reported inside the flight, so one failed refresh emits one event no
    * matter how many callers joined it, and the shared promise can never reject.
@@ -225,10 +251,11 @@ export class FencedCache {
     generation: number,
     options: GetOrComputeOptions,
   ): void {
-    void this.refreshFlights.run(this.freshKey(key), async () => {
+    void this.refreshFlights.run(this.flightKey(key, generation), async () => {
       try {
         const value = await loader();
-        await this.write(key, value, generation, options);
+        const accepted = await this.write(key, value, generation, options);
+        this.emitEvent({ type: 'refreshCompleted', key, generation, accepted });
       } catch (error) {
         this.emitError({ operation: 'swrRefresh', key, error });
       }
@@ -253,27 +280,55 @@ export class FencedCache {
     value: unknown,
     generation: number,
     options: GetOrComputeOptions,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const raw = this.serializer.serialize(value);
-    const accepted = await this.fencedSet(this.freshKey(key), raw, generation, options.ttlMs);
+    const accepted = await this.fencedSet(key, 'fresh', raw, generation, options.ttlMs);
     // A rejected fresh write means the generation already moved; since it only ever moves
     // forward, the stale write would be rejected too.
     if (accepted && options.staleTtlMs !== undefined) {
-      await this.fencedSet(this.staleKey(key), raw, generation, options.staleTtlMs);
+      return this.fencedSet(key, 'stale', raw, generation, options.staleTtlMs);
     }
+    return accepted;
   }
 
   private async fencedSet(
-    storageKey: string,
+    key: string,
+    entry: 'fresh' | 'stale',
     raw: string,
     generation: number,
     ttlMs: number,
   ): Promise<boolean> {
+    const storageKey = entry === 'fresh' ? this.freshKey(key) : this.staleKey(key);
     const reply = await this.redis.eval(FENCED_SET_SCRIPT, {
       keys: [this.counterKey, storageKey],
       arguments: [String(generation), raw, String(ttlMs)],
     });
+    if (reply === 0) {
+      this.emitEvent({ type: 'fenceRejected', key, generation, entry });
+    }
     return reply === 1;
+  }
+
+  private async readSnapshot(key: string, includeStale: boolean): Promise<CacheSnapshot> {
+    const keys = [this.counterKey, this.freshKey(key)];
+    if (includeStale) {
+      keys.push(this.staleKey(key));
+    }
+    const reply = await this.redis.eval(READ_SCRIPT, { keys, arguments: [] });
+    if (
+      !Array.isArray(reply) ||
+      reply.length !== 3 ||
+      typeof reply[0] !== 'string' ||
+      typeof reply[2] !== 'string' ||
+      (reply[1] !== 'fresh' &&
+        reply[1] !== 'stale' &&
+        reply[1] !== 'miss' &&
+        reply[1] !== 'freshError' &&
+        reply[1] !== 'staleError')
+    ) {
+      throw new Error(FENCED_CACHE_ERRORS.invalidReadReply());
+    }
+    return { generation: parseGeneration(reply[0]), status: reply[1], raw: reply[2] };
   }
 
   private async readEntry(storageKey: string): Promise<CacheEntry> {
@@ -290,7 +345,7 @@ export class FencedCache {
     let deleted = 0;
     let pending: string[] = [];
     const iterator = this.redis.scanIterator({
-      MATCH: `${this.dataPrefix}*`,
+      MATCH: `${this.dataPrefix.replace(/[\\*?[\]]/g, '\\$&')}*`,
       COUNT: this.scanCount,
     });
     for await (const entry of iterator) {
@@ -319,6 +374,18 @@ export class FencedCache {
 
   private staleKey(key: string): string {
     return `${this.dataPrefix}s:${key}`;
+  }
+
+  private flightKey(key: string, generation: number): string {
+    return `${generation}:${this.freshKey(key)}`;
+  }
+
+  private emitEvent(event: FencedCacheEvent): void {
+    try {
+      this.onEvent?.(event);
+    } catch {
+      // Observers must not change the cache outcome or interrupt a refresh.
+    }
   }
 
   private emitError(event: FencedCacheErrorEvent): void {

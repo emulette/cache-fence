@@ -4,15 +4,17 @@
  *
  * Packs the repo with `npm pack`, installs the resulting tarball into a throwaway
  * consumer project, then runs the library from both an ESM and a CJS entry point
- * against a small in-memory fake of the Redis adapter. This is the only check that
+ * against a real throwaway Redis server. This is the only check that
  * exercises the package as a real consumer would install it, rather than importing
  * source files directly, so it catches export-map and build-output mistakes that
  * `vitest` never sees.
  *
- * Plain Node, no dependencies: this must run before the library can be trusted to
- * actually work once published.
+ * Uses the repository's Redis client and testcontainers dev dependencies; only the
+ * packed library is installed into the consumer project.
  */
 import { execFileSync } from 'node:child_process';
+import { RedisContainer } from '@testcontainers/redis';
+import { createRequire } from 'node:module';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -24,63 +26,7 @@ function log(message) {
   process.stdout.write(`[consumer-test] ${message}\n`);
 }
 
-/**
- * The five-operation `RedisCommands` fake shared by the generated ESM and CJS
- * consumer scripts. Inlined as source text into both files so neither one needs a
- * second local module to import or require.
- *
- * Uses string concatenation rather than template literals so this source can be
- * embedded inside this script's own template literals without escaping.
- */
-const FAKE_REDIS_SOURCE = [
-  'function createFakeRedis() {',
-  '  const store = new Map();',
-  '  return {',
-  '    async get(key) {',
-  '      return store.has(key) ? store.get(key) : null;',
-  '    },',
-  '    async incr(key) {',
-  '      const next = (store.has(key) ? Number(store.get(key)) : 0) + 1;',
-  '      store.set(key, String(next));',
-  '      return next;',
-  '    },',
-  "    // Mirrors the library's Lua CAS script: compare the counter key (KEYS[1])",
-  '    // to the captured generation (ARGV[1]), and only then set the data key',
-  '    // (KEYS[2]) to the new value (ARGV[2]).',
-  '    async eval(_script, options) {',
-  '      const counterKey = options.keys[0];',
-  '      const dataKey = options.keys[1];',
-  '      const generation = options.arguments[0];',
-  '      const value = options.arguments[1];',
-  "      const current = store.has(counterKey) ? store.get(counterKey) : '0';",
-  '      if (current !== generation) {',
-  '        return 0;',
-  '      }',
-  '      store.set(dataKey, value);',
-  '      return 1;',
-  '    },',
-  '    async *scanIterator(options) {',
-  "      const prefix = options.MATCH.endsWith('*')",
-  '        ? options.MATCH.slice(0, -1)',
-  '        : options.MATCH;',
-  '      for (const key of store.keys()) {',
-  '        if (key.startsWith(prefix)) {',
-  '          yield key;',
-  '        }',
-  '      }',
-  '    },',
-  '    async unlink(keys) {',
-  '      let deleted = 0;',
-  '      for (const key of keys) {',
-  '        if (store.delete(key)) {',
-  '          deleted += 1;',
-  '        }',
-  '      }',
-  '      return deleted;',
-  '    },',
-  '  };',
-  '}',
-].join('\n');
+const redisEntry = createRequire(import.meta.url).resolve('redis');
 
 /** Shared assertions and checks, run against both the ESM and CJS builds. */
 const ASSERTIONS_SOURCE = [
@@ -93,8 +39,10 @@ const ASSERTIONS_SOURCE = [
   '}',
   '',
   'async function runConsumerChecks(createFencedCache, label) {',
-  '  const redis = createFakeRedis();',
-  "  const cache = createFencedCache({ redis, namespace: 'consumer-test' });",
+  '  const redis = createClient({ url: process.argv[2] });',
+  '  await redis.connect();',
+  '  try {',
+  "  const cache = createFencedCache({ redis, namespace: 'consumer-test-' + label });",
   '  let computeCount = 0;',
   '  const loader = async () => {',
   '    computeCount += 1;',
@@ -167,11 +115,14 @@ const ASSERTIONS_SOURCE = [
   "    '[' + label + '] a write at the current generation must be accepted',",
   '  );',
   '',
-  "  console.log('[' + label + '] ok');",
+  "  process.stdout.write('[' + label + '] ok\\n');",
+  '  } finally {',
+  '    await redis.close();',
+  '  }',
   '}',
 ].join('\n');
 
-const ESM_TEST_SOURCE = `${FAKE_REDIS_SOURCE}
+const ESM_TEST_SOURCE = `import { createClient } from ${JSON.stringify(redisEntry)};
 
 ${ASSERTIONS_SOURCE}
 
@@ -180,7 +131,7 @@ import { createFencedCache } from 'cache-fence';
 await runConsumerChecks(createFencedCache, 'esm');
 `;
 
-const CJS_TEST_SOURCE = `${FAKE_REDIS_SOURCE}
+const CJS_TEST_SOURCE = `const { createClient } = require(${JSON.stringify(redisEntry)});
 
 ${ASSERTIONS_SOURCE}
 
@@ -231,14 +182,16 @@ function installTarball(consumerDir, tarballPath) {
   run('npm', ['install', '--no-audit', '--no-fund', tarballPath], { cwd: consumerDir });
 }
 
-function runCheck(consumerDir, fileName, source) {
+function runCheck(consumerDir, fileName, source, redisUrl) {
   writeFileSync(join(consumerDir, fileName), source);
   log(`running ${fileName}...`);
-  const output = run('node', [fileName], { cwd: consumerDir });
+  const output = run('node', [fileName, redisUrl], { cwd: consumerDir });
   process.stdout.write(output);
 }
 
-function main() {
+async function main() {
+  const container = await new RedisContainer('redis:7-alpine').start();
+  const redisUrl = container.getConnectionUrl();
   const workDir = mkdtempSync(join(tmpdir(), 'cache-fence-consumer-'));
   const packDir = join(workDir, 'pack');
   const consumerDir = join(workDir, 'consumer');
@@ -248,8 +201,8 @@ function main() {
   try {
     const tarballPath = packTarball(packDir);
     installTarball(consumerDir, tarballPath);
-    runCheck(consumerDir, 'esm-test.mjs', ESM_TEST_SOURCE);
-    runCheck(consumerDir, 'cjs-test.cjs', CJS_TEST_SOURCE);
+    runCheck(consumerDir, 'esm-test.mjs', ESM_TEST_SOURCE, redisUrl);
+    runCheck(consumerDir, 'cjs-test.cjs', CJS_TEST_SOURCE, redisUrl);
     log('all consumer checks passed.');
   } catch (error) {
     process.stderr.write('[consumer-test] FAILED: the package does not work as installed.\n');
@@ -261,7 +214,8 @@ function main() {
     process.exitCode = 1;
   } finally {
     rmSync(workDir, { recursive: true, force: true });
+    await container.stop();
   }
 }
 
-main();
+await main();

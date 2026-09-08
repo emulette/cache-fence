@@ -15,6 +15,7 @@ Requires Docker running and Node >= 22.
 
 ```sh
 npm install
+npm run build
 node bench/run.mjs
 ```
 
@@ -44,15 +45,13 @@ the same storage key: N=5,000, warmup 500. The loader is asserted to run exactly
 once (during priming) and never again — if these were not cache hits, the script
 fails rather than reporting a flattering number.
 
-This is where the design cost shows: the hit path captures the generation *before*
-reading the cache, so it pays two sequential round trips where an unfenced cache
-pays one. The expected result is ~2× the latency of a bare `GET`, and that is what
-the numbers show. The baseline `JSON.parse`s the reply, so again the delta is the
-extra round trip (plus single-flight bookkeeping), not deserialization.
+The hit path captures the generation and reads the cache inside one Lua command.
+It pays one round trip, like the raw `GET` baseline. The baseline `JSON.parse`s the
+reply, so the delta measures scripting and snapshot decoding rather than JSON.
 
-The second round trip is the guarantee, not an inefficiency: caching the
-generation locally would remove it and simultaneously remove the reason the fence
-works.
+Every request still reads the generation from Redis before joining a computation;
+the generation is never cached locally. Concurrent misses share the loader and
+write-back for their key and generation, but each performs its own snapshot read.
 
 ### 3. Invalidation sweep cost
 
@@ -91,8 +90,7 @@ Read these before quoting any number.
    and unfenced is the signal; the microseconds are not.
 2. **Docker adds virtualization overhead** to the loopback path. A native or
    remote Redis changes every absolute number. Over a real network the fixed
-   per-round-trip cost grows, which makes benchmark 2's extra round trip *more*
-   expensive and benchmark 1's Lua overhead *less* noticeable.
+   per-round-trip cost grows, making the fixed scripting overhead *less* noticeable.
 3. **node-redis sends the full Lua script body on every `EVAL`** — it does not
    transparently use `EVALSHA`. The fenced write therefore carries a few hundred
    extra bytes per call. A client that caches the script SHA would shave part of
@@ -118,16 +116,20 @@ Read these before quoting any number.
 
 ## Sample results
 
-Recorded on 2026-08-19, Apple M4 Pro, macOS, Node v22.21.1, Redis 7.4.10 in
+Recorded for v0.1.2 on 2026-09-08, Apple M4 Pro, macOS, Node v26.5.0, Redis 7.4.10 in
 Docker (OrbStack). Reproduce locally rather than trusting these.
 
 | operation                                 | p50 µs | p95 µs | p99 µs | mean µs |  ops/s |
 | ----------------------------------------- | -----: | -----: | -----: | ------: | -----: |
-| setIfGeneration (fenced, Lua CAS)         |   89.6 |  108.8 |  152.9 |    91.9 | 10,877 |
-| SET key value PX ttl (unfenced)           |   84.8 |  102.9 |  155.3 |    87.5 | 11,426 |
-| getOrCompute hit (fenced, 2 round trips)  |  164.0 |  188.5 |  321.7 |   168.9 |  5,921 |
-| GET + JSON.parse (unfenced, 1 round trip) |   81.8 |   95.7 |  136.4 |    84.3 | 11,860 |
+| setIfGeneration (fenced, Lua CAS)         |   93.6 |  123.9 |  184.0 |    98.1 | 10,194 |
+| SET key value PX ttl (unfenced)           |   88.3 |  117.1 |  191.1 |    93.4 | 10,704 |
+| getOrCompute hit (fenced, 1 round trip)  |   93.8 |  125.8 |  276.2 |   100.9 |  9,910 |
+| GET + JSON.parse (unfenced, 1 round trip) |   86.0 |  109.9 |  222.0 |    91.2 | 10,970 |
 
-Fenced write: **+5.6% p50** over a plain `SET`. Fenced cache hit: **+100.4% p50**
-over a raw `GET`, i.e. the second round trip and nothing more. Invalidating a
-10,000-key namespace: **10.0 ms**, ~1.0M keys/s.
+Fenced write: **+5.9% p50** over a plain `SET`. Fenced cache hit: **+9.0% p50**
+over a raw `GET`. Invalidating a 10,000-key namespace: **9.6 ms**, ~1.0M keys/s.
+
+The unmodified v0.1.1 build measured **169.2 µs p50** for a cache hit in a separate
+run on the same machine and Node version (raw `GET`: 84.9 µs). v0.1.2 measured
+**93.8 µs**, about **45% lower p50 latency** after removing the second round trip.
+These are single-run observations, subject to the caveats above.

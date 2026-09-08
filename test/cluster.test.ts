@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createFencedCache, type FencedCache } from '../src/index';
 import { startClusterFixture, type ClusterFixture } from './cluster-fixture';
-import { deferred, storageKeys } from './redis-fixture';
+import { deferred, poll, storageKeys } from './redis-fixture';
 
 /**
  * Redis Cluster coverage. Boots a real three-master cluster in Docker, so it is gated
@@ -73,6 +73,54 @@ describe.skipIf(process.env.CLUSTER_TESTS !== '1')('redis cluster', () => {
       expect(await cache.generation()).toBe(1);
       expect(await cache.setIfGeneration('works', 'v2', 1, { ttlMs: TTL_MS })).toBe(true);
       expect(await cache.get<string>('works')).toBe('v2');
+    });
+
+    it('serves fresh and stale hits with one snapshot read through the cluster', async () => {
+      let reads = 0;
+      const cache = createFencedCache({
+        namespace: 'catalog',
+        redis: {
+          ...fx.commands,
+          get: (key) => {
+            reads += 1;
+            return fx.commands.get(key);
+          },
+          eval: (script, options) => {
+            if (options.arguments.length === 0) {
+              reads += 1;
+            }
+            return fx.commands.eval(script, options);
+          },
+        },
+      });
+      const options = { ttlMs: TTL_MS, staleTtlMs: TTL_MS * 2 };
+      await cache.getOrCompute('works', async () => 'v1', options);
+      reads = 0;
+      expect(await cache.getOrCompute('works', async () => 'unexpected', options)).toBe('v1');
+      expect(reads).toBe(1);
+
+      await fx.cluster.unlink(storageKeys.fresh('catalog', 'works'));
+      reads = 0;
+      const gate = deferred();
+      try {
+        expect(
+          await cache.getOrCompute(
+            'works',
+            async () => {
+              await gate.promise;
+              return 'v2';
+            },
+            options,
+          ),
+        ).toBe('v1');
+        expect(reads).toBe(1);
+      } finally {
+        gate.resolve();
+        await poll(
+          async () => (await fx.cluster.get(storageKeys.stale('catalog', 'works'))) === '"v2"',
+        );
+      }
+      expect(await cache.get('works')).toBe('v2');
     });
 
     it('rejects a write carrying a generation an invalidation moved past', async () => {

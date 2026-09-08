@@ -64,4 +64,25 @@ describe('invalidation sweep', () => {
     expect(await other.get<string>('kept')).toBe('x');
     expect(await other.generation()).toBe(otherGeneration);
   });
+
+  it.each([
+    ['tenant[1]', 'tenant1'],
+    ['tenant?', 'tenant1'],
+    ['tenant\\1', 'tenant1'],
+  ])('treats namespace %s literally while sweeping', async (namespace, neighbour) => {
+    const cache = createFencedCache({ redis: fx.commands, namespace });
+    const other = createFencedCache({ redis: fx.commands, namespace: neighbour });
+    await cache.getOrCompute('item', async () => 'old', { ttlMs: 60_000, staleTtlMs: 120_000 });
+    await other.setIfGeneration('item', 'kept', 0, { ttlMs: 60_000 });
+
+    const result = await cache.invalidate();
+
+    expect(await other.get('item')).toBe('kept');
+    expect(await other.generation()).toBe(0);
+    expect(result).toEqual({ generation: 1, deletedKeys: 2 });
+    expect(await cache.get('item')).toBeUndefined();
+    expect(
+      await cache.getOrCompute('item', async () => 'new', { ttlMs: 60_000, staleTtlMs: 120_000 }),
+    ).toBe('new');
+  });
 });

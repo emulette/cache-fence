@@ -25,7 +25,7 @@ export type FencedCacheOperation = 'generation' | 'get' | 'setIfGeneration' | 's
  * Emitted for errors the cache suppressed to stay fail-closed, such as a skipped
  * write while Redis is unreachable or a failed background refresh.
  *
- * A fence rejection is not an error and never produces an event: it means an
+ * A fence rejection is not an error and never produces an error event: it means an
  * invalidation crossed the computation and the write was correctly dropped.
  */
 export interface FencedCacheErrorEvent {
@@ -34,6 +34,13 @@ export interface FencedCacheErrorEvent {
   key?: string;
   error: unknown;
 }
+
+/** Optional observations; fence rejections are normal outcomes, not errors. */
+export type FencedCacheEvent =
+  | { type: 'hit'; key: string; source: 'fresh' | 'stale' }
+  | { type: 'miss'; key: string }
+  | { type: 'fenceRejected'; key: string; generation: number; entry: 'fresh' | 'stale' }
+  | { type: 'refreshCompleted'; key: string; generation: number; accepted: boolean };
 
 export interface FencedCacheOptions {
   redis: RedisCommands;
@@ -50,6 +57,8 @@ export interface FencedCacheOptions {
   serializer?: Serializer;
   /** Receives errors the cache suppressed. Exceptions thrown here are ignored. */
   onError?: (event: FencedCacheErrorEvent) => void;
+  /** Receives cache outcomes synchronously. Exceptions thrown here are ignored. */
+  onEvent?: (event: FencedCacheEvent) => void;
 }
 
 export interface GetOrComputeOptions {

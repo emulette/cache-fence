@@ -164,6 +164,7 @@ import type {
   GetOrComputeOptions,
   InvalidationResult,
   FencedCacheErrorEvent,
+  FencedCacheEvent,
   FencedCacheOperation,
   RedisCommands,
   Serializer,
@@ -180,6 +181,7 @@ import type {
 | `unlinkBatchSize` | `number` | `1000` | Keys per `UNLINK` call during the sweep. |
 | `serializer` | `Serializer` | JSON | `{ serialize(value: unknown): string; deserialize(raw: string): unknown }`. |
 | `onError` | `(event: FencedCacheErrorEvent) => void` | — | Receives errors the cache suppressed. Exceptions thrown by the handler are ignored. |
+| `onEvent` | `(event: FencedCacheEvent) => void` | — | Receives cache outcomes for metrics or logging. Exceptions thrown by the handler are ignored. |
 
 Key layout, for the namespace `catalog`:
 
@@ -189,25 +191,30 @@ Key layout, for the namespace `catalog`:
 {catalog}:k:s:<key>  stale entry (only when staleTtlMs is set)
 ```
 
-The sweep matches `{catalog}:k:*`, which is why the counter lives outside that prefix.
+The sweep matches `{catalog}:k:*`, which is why the counter lives outside that prefix. Accepted namespace
+characters such as `?`, `[` and `\` are escaped in the scan pattern and always matched literally.
 
 ### `getOrCompute<T>(key, loader, options): Promise<T>`
 
 `options`: `{ ttlMs: number; staleTtlMs?: number }`. Both must be positive integers; `staleTtlMs` enables
 stale-while-revalidate and should exceed `ttlMs`.
 
-Sequence: capture the generation → read the fresh entry → (if SWR) read the stale entry and, on a hit, serve it
-immediately while a fenced background refresh runs → otherwise run `loader` → write back through the fence.
+Sequence: one Lua command captures the generation and reads the fresh entry, consulting the stale entry only
+on a fresh miss with SWR enabled → serve a hit (starting a fenced background refresh for a stale hit) → otherwise
+run `loader` → write back through the fence. Both fresh and stale lookups take one Redis round trip.
 
-- **Single-flight**: concurrent callers for the same key in the same process share one computation. In-process
-  deduplication only — it is not a distributed lock, and does not claim to be.
+- **Single-flight**: concurrent misses for the same key and generation on the same `FencedCache` instance share
+  one computation. Each caller reads the current generation before joining, so a request after a completed
+  invalidation cannot join a pre-invalidation computation, even if another instance performed the invalidation.
+  If the generation cannot be verified, the caller runs its loader independently without caching.
 - **Loader errors propagate.** They are yours; the cache does not swallow them.
-- **A fence rejection is silent and correct.** The computed value is still returned to the caller, it is just not
-  cached. No error, no event.
+- **A fence rejection is a normal outcome.** The computed value is still returned to the caller without being
+  cached. It produces no error; an optional `onEvent` observer receives `fenceRejected`.
 - A cached `null` is a hit and comes back as `null`.
 - **With SWR**, the background refresh reuses the generation captured when the serving request started, so a
-  refresh spanning an invalidation is rejected too. Refreshes are deduplicated per key, so they cannot stack, and
-  the stale entry is only written when the fresh write was accepted.
+  refresh spanning an invalidation is rejected too. Refreshes are deduplicated per key and generation, so a new
+  generation can refresh while an old generation's refresh is still running. The stale entry is only written
+  when the fresh write was accepted.
 - **No cancellation or timeout contract.** The loader runs to completion — there is no `AbortSignal` support,
   and concurrent callers joined to a flight share its outcome. If the computation needs a deadline, enforce it
   inside the loader.
@@ -246,7 +253,32 @@ namespace is something the caller must be able to see and retry.
 
 Every message this library can produce, as functions. Nothing else in the package builds message strings, so
 tests can assert against these instead of hardcoding text: `invalidNamespace`, `invalidGeneration`,
-`invalidTtl`, `unserializableValue`.
+`invalidReadReply`, `invalidTtl`, `unserializableValue`.
+
+### Observing cache outcomes
+
+`onEvent` is an optional synchronous callback, separate from `onError`. It needs no metrics dependency:
+
+```ts
+const cache = createFencedCache({
+  redis,
+  namespace: 'catalog',
+  onEvent: (event) => logger.debug({ event }, 'cache outcome'),
+});
+```
+
+| `event.type` | Additional fields | When it fires |
+| --- | --- | --- |
+| `hit` | `key`, `source: 'fresh' \| 'stale'` | A `getOrCompute` request returns a cached value. |
+| `miss` | `key` | A `getOrCompute` request has a valid snapshot but no usable cached value. |
+| `fenceRejected` | `key`, `generation`, `entry: 'fresh' \| 'stale'` | A write is rejected, including low-level `setIfGeneration` writes. |
+| `refreshCompleted` | `key`, `generation`, `accepted` | A background refresh finishes its write attempts without an error. `accepted` is false if a fence rejected either copy. |
+
+Keys are the caller's keys without storage prefixes. Hits and misses count requests, even when several misses
+share one loader. Refresh completion and fence rejection count actual work, not callers joined to that work.
+A failed refresh reports through `onError` instead of emitting `refreshCompleted`. A failed or invalid snapshot
+reports `operation: 'generation'` through `onError` and emits no hit or miss. Plain `get()` emits no outcome events.
+Exceptions thrown by the observer are ignored.
 
 ### Redis client adapter
 
@@ -292,12 +324,12 @@ When Redis is unreachable, the correct answer is a slow answer, not a fast wrong
 
 | Situation | Behavior | `onError` event |
 | --- | --- | --- |
-| Generation read fails | Run `loader`, return the value, cache nothing (an unfenceable write is not attempted) | `operation: 'generation'` |
+| Snapshot command fails, its reply is malformed, or the generation is invalid | Run `loader` independently, return the value, cache nothing | `operation: 'generation'` |
 | Fresh read fails | Run `loader`, return the value, skip the write-back | `operation: 'get'` |
 | Stale read fails (SWR) | Fall through to `loader`; the fenced write-back is still attempted | `operation: 'get'` |
 | Write fails (Redis error or serialization) | Value is still returned to the caller | `operation: 'setIfGeneration'` |
 | Background SWR refresh fails | Nothing surfaces to any caller; never an unhandled rejection | `operation: 'swrRefresh'` |
-| **Fence rejects the write** | Value returned, not cached | **none — this is not an error** |
+| **Fence rejects the write** | Value returned, not cached; optional `onEvent` receives `fenceRejected` | **none — this is not an error** |
 | `loader` throws | Propagates to the caller | none |
 
 ```ts
@@ -358,15 +390,16 @@ are the signal):
 
 | operation | p50 µs | mean µs | vs unfenced (p50) |
 | --- | ---: | ---: | ---: |
-| `setIfGeneration` (fenced write, Lua CAS) | 89.6 | 91.9 | +5.6% |
-| plain `SET` with TTL (baseline) | 84.8 | 87.5 | — |
-| `getOrCompute` cache hit (2 round trips) | 164.0 | 168.9 | +100.4% |
-| raw `GET` (baseline, 1 round trip) | 81.8 | 84.3 | — |
+| `setIfGeneration` (fenced write, Lua CAS) | 93.6 | 98.1 | +5.9% |
+| plain `SET` with TTL (baseline) | 88.3 | 93.4 | — |
+| `getOrCompute` cache hit (1 round trip) | 93.8 | 100.9 | +9.0% |
+| raw `GET` (baseline, 1 round trip) | 86.0 | 91.2 | — |
 
 - A fenced write stays one round trip: the ~6% is the Lua interpreter plus a server-side counter `GET`.
-- A fenced cache hit pays a second round trip for the generation read — the design cost of the guarantee,
-  roughly 2× a raw `GET` on loopback.
-- Invalidating a 10,000-key namespace takes ~10 ms (~1M keys/s). Note that `SCAN` traverses the whole
+- A fenced cache hit reads the generation and value atomically in one round trip. In a same-machine comparison,
+  v0.1.1 measured 169.2 µs p50 and v0.1.2 measured 93.8 µs, about 45% lower latency. This is a local measurement,
+  not a universal speedup; see the benchmark caveats.
+- Invalidating a 10,000-key namespace takes ~9.6 ms (~1M keys/s). Note that `SCAN` traverses the whole
   keyspace, not just the namespace, so sweep time scales with total database size.
 
 Methodology, caveats and reproduction: [bench/](bench/).

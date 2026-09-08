@@ -24,7 +24,9 @@ function countEvals(base: RedisCommands): {
       ...base,
       eval: async (script, options) => {
         const reply = await base.eval(script, options);
-        completed += 1;
+        if (options.arguments.length > 0) {
+          completed += 1;
+        }
         return reply;
       },
     },
@@ -120,6 +122,71 @@ describe('getOrCompute', () => {
     const reloaded = await cache.getOrCompute(KEY, async () => db, { ttlMs: TTL_MS });
     expect(reloaded).toBe('v2');
     expect(await cache.get<string>(KEY)).toBe('v2');
+  });
+
+  it('does not join an old flight after another instance invalidates the namespace', async () => {
+    const gate = deferred();
+    const started = deferred();
+    const oldRequest = cache.getOrCompute(
+      KEY,
+      async () => {
+        started.resolve();
+        await gate.promise;
+        return 'v1';
+      },
+      { ttlMs: TTL_MS },
+    );
+    await started.promise;
+    const invalidator = createFencedCache({ redis: fx.commands, namespace: NAMESPACE });
+    await invalidator.invalidate();
+
+    const newRequest = cache.getOrCompute(KEY, async () => 'v2', { ttlMs: TTL_MS });
+    gate.resolve();
+
+    expect(await Promise.all([oldRequest, newRequest])).toEqual(['v1', 'v2']);
+    expect(await cache.get(KEY)).toBe('v2');
+  });
+
+  it('starts a new generation refresh while an old generation refresh is pending', async () => {
+    const options = { ttlMs: SHORT_TTL_MS, staleTtlMs: TTL_MS };
+    await cache.getOrCompute(KEY, async () => 'v1', options);
+    await poll(async () => (await cache.get(KEY)) === undefined);
+    const gate = deferred();
+    await cache.getOrCompute(
+      KEY,
+      async () => {
+        await gate.promise;
+        return 'old-refresh';
+      },
+      options,
+    );
+
+    try {
+      const other = createFencedCache({ redis: fx.commands, namespace: NAMESPACE });
+      await other.invalidate();
+      await other.getOrCompute(KEY, async () => 'v2', options);
+      await poll(async () => (await other.get(KEY)) === undefined);
+
+      let refreshes = 0;
+      const writesBeforeRefresh = completedEvals();
+      expect(
+        await cache.getOrCompute(
+          KEY,
+          async () => {
+            refreshes += 1;
+            return 'v3';
+          },
+          { ttlMs: TTL_MS, staleTtlMs: TTL_MS },
+        ),
+      ).toBe('v2');
+      expect(refreshes).toBe(1);
+      await poll(() => completedEvals() === writesBeforeRefresh + 2);
+      expect(await cache.get(KEY)).toBe('v3');
+    } finally {
+      const writesBeforeRelease = completedEvals();
+      gate.resolve();
+      await poll(() => completedEvals() > writesBeforeRelease);
+    }
   });
 
   it('serves the stale value immediately and lands the background refresh through the fence', async () => {
