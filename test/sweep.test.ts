@@ -26,9 +26,8 @@ describe('invalidation sweep', () => {
       unlinkBatchSize: 200,
     });
 
-    await cache.bumpGeneration();
-    const generation = await cache.generation();
-    expect(generation).toBe(1);
+    const generation = await cache.bumpGeneration();
+    expect(await cache.generation()).toBe(generation);
 
     const writes = await Promise.all(
       Array.from({ length: 1500 }, (_, i) =>
@@ -39,14 +38,13 @@ describe('invalidation sweep', () => {
 
     const result = await cache.invalidate();
 
-    expect(result.generation).toBe(2);
+    expect(result.generation).not.toBe(generation);
     expect(result.deletedKeys).toBe(1500);
     expect(await cache.get('item-0')).toBeUndefined();
     expect(await cache.get('item-749')).toBeUndefined();
     expect(await cache.get('item-1499')).toBeUndefined();
-    // The counter lives outside the swept prefix; wiping it would reset the fence
-    // and make every in-flight pre-invalidation write acceptable again.
-    expect(await cache.generation()).toBe(2);
+    // Cleanup preserves the current metadata so subsequent readers share its token.
+    expect(await cache.generation()).toBe(result.generation);
   });
 
   it('leaves another namespace keys and generation untouched', async () => {
@@ -73,13 +71,14 @@ describe('invalidation sweep', () => {
     const cache = createFencedCache({ redis: fx.commands, namespace });
     const other = createFencedCache({ redis: fx.commands, namespace: neighbour });
     await cache.getOrCompute('item', async () => 'old', { ttlMs: 60_000, staleTtlMs: 120_000 });
-    await other.setIfGeneration('item', 'kept', 0, { ttlMs: 60_000 });
+    const otherGeneration = await other.generation();
+    await other.setIfGeneration('item', 'kept', otherGeneration, { ttlMs: 60_000 });
 
     const result = await cache.invalidate();
 
     expect(await other.get('item')).toBe('kept');
-    expect(await other.generation()).toBe(0);
-    expect(result).toEqual({ generation: 1, deletedKeys: 2 });
+    expect(await other.generation()).toBe(otherGeneration);
+    expect(result).toEqual({ generation: await cache.generation(), deletedKeys: 2 });
     expect(await cache.get('item')).toBeUndefined();
     expect(
       await cache.getOrCompute('item', async () => 'new', { ttlMs: 60_000, staleTtlMs: 120_000 }),

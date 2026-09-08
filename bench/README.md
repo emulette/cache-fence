@@ -31,21 +31,22 @@ part of the published package.
 `setIfGeneration()` against a raw `SET key value PX ttl` of the same serialized
 value, on the same connection: N=5,000, warmup 500.
 
-The fenced write is one `EVAL` round trip whose Lua body does a counter `GET`, a
+The fenced write is one `EVAL` round trip whose Lua body does a generation `GET`, a
 comparison against the captured generation, and a conditional `SET`. So it is the
 same single round trip as the baseline, plus the Lua interpreter and one
 server-side `GET`. The baseline calls `JSON.stringify` per operation too, exactly
 as `setIfGeneration` does internally, so the delta is the fence and not the
-serializer.
+serializer. The fenced value adds a 36-byte UUID and a newline (37 bytes per copy).
 
 ### 2. getOrCompute hit path vs raw GET
 
 One primed key, then N=5,000 `getOrCompute()` cache hits against N raw `GET`s of
-the same storage key: N=5,000, warmup 500. The loader is asserted to run exactly
+a separate key containing the same unstamped JSON payload: N=5,000, warmup 500. The loader is asserted to run exactly
 once (during priming) and never again — if these were not cache hits, the script
 fails rather than reporting a flattering number.
 
 The hit path captures the generation and reads the cache inside one Lua command.
+It verifies and strips the generation stamp before returning the payload.
 It pays one round trip, like the raw `GET` baseline. The baseline `JSON.parse`s the
 reply, so the delta measures scripting and snapshot decoding rather than JSON.
 
@@ -56,8 +57,9 @@ write-back for their key and generation, but each performs its own snapshot read
 ### 3. Invalidation sweep cost
 
 10,000 keys populated in the namespace, then a single `invalidate()` timed
-end-to-end: `INCR` on the counter followed by a `SCAN` sweep that `UNLINK`s
-matching keys in batches. Reported as deleted keys, total milliseconds and
+end-to-end: rotate the token, then `SCAN` and use Lua to check entry stamps with
+`GETRANGE` and `UNLINK` obsolete entries in bounded batches. New-generation entries
+are preserved even if written between SCAN and cleanup. Reported as deleted keys, total milliseconds and
 keys/second, over 3 rounds (repopulated each round) with the median round
 highlighted. Setup writes are pipelined in `Promise.all` chunks of 500 for speed
 and are not part of the measurement.
@@ -75,7 +77,7 @@ and are not part of the measurement.
 - **Sequential, one connection, one command in flight.** `ops/s` is therefore
   exactly `1 / mean latency` — a latency reciprocal, *not* a saturation throughput
   number. A real application with pipelining and concurrency will see far higher
-  absolute throughput; the ratio is what carries over.
+  absolute throughput; measure again with the intended topology and workload.
 - **Assertions inside the loop.** Every fenced write must be accepted, every cache
   hit must return the cached value, the loader must never run, and the sweep must
   delete exactly 10,000 keys. A benchmark that stopped doing the work it claims to
@@ -103,7 +105,7 @@ Read these before quoting any number.
    keys. The benchmark runs against a database flushed to contain only the
    namespace's 10,000 keys — a best case. A namespace of 10,000 keys inside a
    database of 10 million will sweep far more slowly.
-6. **The first sweep round is consistently the slowest** (allocator and dict
+6. **The first sweep round is often the slowest** (allocator and dict
    warmup), which is why 3 rounds are run and the median is reported.
 7. **The payload is a 168-byte JSON object.** Larger values shift cost toward
    bandwidth and away from fixed per-command overhead, shrinking the *relative*
@@ -116,20 +118,20 @@ Read these before quoting any number.
 
 ## Sample results
 
-Recorded for v0.1.2 on 2026-09-08, Apple M4 Pro, macOS, Node v26.5.0, Redis 7.4.10 in
+Recorded for v0.2.0 on 2026-09-08, Apple M4 Pro, macOS, Node v26.5.0, Redis 7.4.10 in
 Docker (OrbStack). Reproduce locally rather than trusting these.
 
-| operation                                 | p50 µs | p95 µs | p99 µs | mean µs |  ops/s |
-| ----------------------------------------- | -----: | -----: | -----: | ------: | -----: |
-| setIfGeneration (fenced, Lua CAS)         |   93.6 |  123.9 |  184.0 |    98.1 | 10,194 |
-| SET key value PX ttl (unfenced)           |   88.3 |  117.1 |  191.1 |    93.4 | 10,704 |
-| getOrCompute hit (fenced, 1 round trip)  |   93.8 |  125.8 |  276.2 |   100.9 |  9,910 |
-| GET + JSON.parse (unfenced, 1 round trip) |   86.0 |  109.9 |  222.0 |    91.2 | 10,970 |
+| operation | p50 µs | p95 µs | p99 µs | mean µs | ops/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| setIfGeneration (fenced, Lua CAS) | 98.4 | 139.3 | 247.0 | 107.7 | 9,284 |
+| SET key value PX ttl (unfenced) | 91.9 | 126.4 | 219.6 | 99.1 | 10,091 |
+| getOrCompute hit (fenced, 1 round trip) | 100.8 | 141.6 | 268.4 | 114.8 | 8,713 |
+| GET + JSON.parse (unfenced, 1 round trip) | 90.3 | 126.9 | 247.3 | 109.2 | 9,158 |
 
-Fenced write: **+5.9% p50** over a plain `SET`. Fenced cache hit: **+9.0% p50**
-over a raw `GET`. Invalidating a 10,000-key namespace: **9.6 ms**, ~1.0M keys/s.
+Fenced write: **+7.1% p50** over plain SET. Verified cache hit: **+11.6% p50**
+over raw GET. Invalidating a 10,000-key namespace: **17.1 ms** median (21.1, 17.1,
+16.7 ms), ~583K keys/s. Cleanup now checks stamps atomically and preserves current
+writes; earlier versions deleted every scanned data key unconditionally.
 
-The unmodified v0.1.1 build measured **169.2 µs p50** for a cache hit in a separate
-run on the same machine and Node version (raw `GET`: 84.9 µs). v0.1.2 measured
-**93.8 µs**, about **45% lower p50 latency** after removing the second round trip.
-These are single-run observations, subject to the caveats above.
+These are single-run observations, subject to the caveats above. Each data copy has
+37 bytes of stamp overhead in addition to the payload and Redis key/object overhead.

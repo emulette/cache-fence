@@ -61,11 +61,12 @@ describe('cache observation events', () => {
       onEvent: (event) => events.push(event),
       onError: (event) => errors.push(event),
     });
+    const generation = await cache.generation();
     await cache.invalidate();
 
-    expect(await cache.setIfGeneration(KEY, 'old', 0, OPTIONS)).toBe(false);
+    expect(await cache.setIfGeneration(KEY, 'old', generation, OPTIONS)).toBe(false);
     expect(await cache.get(KEY)).toBeUndefined();
-    expect(events).toEqual([{ type: 'fenceRejected', key: KEY, generation: 0, entry: 'fresh' }]);
+    expect(events).toEqual([{ type: 'fenceRejected', key: KEY, generation, entry: 'fresh' }]);
     expect(errors).toEqual([]);
   });
 
@@ -81,6 +82,7 @@ describe('cache observation events', () => {
             const reply = await fx.commands.eval(script, options);
             if (
               refreshing &&
+              options.arguments.length === 3 &&
               (reply === 0 || options.keys[1] === storageKeys.stale(NAMESPACE, KEY))
             ) {
               refreshFinished = true;
@@ -91,6 +93,7 @@ describe('cache observation events', () => {
         namespace: NAMESPACE,
         onEvent: (event) => events.push(event),
       });
+      const generation = await cache.generation();
       await cache.getOrCompute(KEY, async () => 'v1', OPTIONS);
       // Evict only the fresh copy so every request takes the SWR path.
       await fx.raw.unlink(storageKeys.fresh(NAMESPACE, KEY));
@@ -132,12 +135,12 @@ describe('cache observation events', () => {
         {
           type: 'refreshCompleted',
           key: KEY,
-          generation: 0,
+          generation,
           accepted: !invalidate,
         },
       ]);
       expect(events.filter((event) => event.type === 'fenceRejected')).toEqual(
-        invalidate ? [{ type: 'fenceRejected', key: KEY, generation: 0, entry: 'fresh' }] : [],
+        invalidate ? [{ type: 'fenceRejected', key: KEY, generation, entry: 'fresh' }] : [],
       );
       expect(await cache.get(KEY)).toBe(invalidate ? undefined : 'v2');
     },
@@ -164,6 +167,7 @@ describe('cache observation events', () => {
         },
       },
     });
+    const generation = await cache.generation();
     await cache.getOrCompute(KEY, async () => 'v1', OPTIONS);
     await fx.raw.unlink(storageKeys.fresh(NAMESPACE, KEY));
     events = [];
@@ -174,8 +178,8 @@ describe('cache observation events', () => {
 
     expect(events).toEqual([
       { type: 'hit', key: KEY, source: 'stale' },
-      { type: 'fenceRejected', key: KEY, generation: 0, entry: 'stale' },
-      { type: 'refreshCompleted', key: KEY, generation: 0, accepted: false },
+      { type: 'fenceRejected', key: KEY, generation, entry: 'stale' },
+      { type: 'refreshCompleted', key: KEY, generation, accepted: false },
     ]);
     expect(await cache.get(KEY)).toBeUndefined();
     expect(await fx.raw.get(storageKeys.stale(NAMESPACE, KEY))).toBeNull();
@@ -192,6 +196,7 @@ describe('cache observation events', () => {
         throw observerFailure;
       },
     });
+    const generation = await cache.generation();
     expect(await cache.getOrCompute(KEY, async () => 'v1', OPTIONS)).toBe('v1');
     expect(await cache.getOrCompute(KEY, async () => 'unexpected', OPTIONS)).toBe('v1');
     await fx.raw.unlink(storageKeys.fresh(NAMESPACE, KEY));
@@ -199,7 +204,7 @@ describe('cache observation events', () => {
     await poll(() => observed === 4);
     expect(await cache.get(KEY)).toBe('v2');
     await cache.invalidate();
-    expect(await cache.setIfGeneration(KEY, 'old', 0, OPTIONS)).toBe(false);
+    expect(await cache.setIfGeneration(KEY, 'old', generation, OPTIONS)).toBe(false);
     expect(observed).toBe(5);
   });
 });

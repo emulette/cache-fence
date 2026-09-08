@@ -4,18 +4,18 @@ import {
   FENCED_CACHE_ERRORS,
   type FencedCacheErrorEvent,
   type RedisCommands,
+  type GenerationToken,
 } from '../src/index';
 
 const NAMESPACE = 'catalog';
 const KEY = 'works';
 const TTL_MS = 60_000;
+const GENERATION = 'd768ad66-6062-4f7f-a76e-ddfba54e5d63' as GenerationToken;
 
 /** Stands in for a Redis that is down, unreachable or refusing the command. */
 const REDIS_DOWN = new Error('the connection to Redis is closed');
 
 interface StubRedisOptions {
-  get?: (key: string) => Promise<string | null>;
-  incr?: () => Promise<number>;
   eval?: () => Promise<unknown>;
   read?: () => Promise<unknown>;
 }
@@ -30,10 +30,8 @@ interface StubRedis {
 function createStubRedis(options: StubRedisOptions = {}): StubRedis {
   let evalCalls = 0;
   const commands: RedisCommands = {
-    get: options.get ?? (() => Promise.reject(REDIS_DOWN)),
-    incr: options.incr ?? (() => Promise.reject(REDIS_DOWN)),
     eval: (_script, { arguments: args }) => {
-      if (args.length === 0) {
+      if (args.length === 1) {
         return options.read === undefined ? Promise.reject(REDIS_DOWN) : options.read();
       }
       evalCalls += 1;
@@ -44,7 +42,6 @@ function createStubRedis(options: StubRedisOptions = {}): StubRedis {
         throw REDIS_DOWN;
       },
     }),
-    unlink: () => Promise.reject(REDIS_DOWN),
   };
   return { commands, evalCalls: () => evalCalls };
 }
@@ -95,7 +92,7 @@ describe('fail-closed behaviour when Redis misbehaves', () => {
   });
 
   it('reports a broken write path as a setIfGeneration error and still returns the value', async () => {
-    const stub = createStubRedis({ read: () => Promise.resolve(['0', 'miss', '']) });
+    const stub = createStubRedis({ read: () => Promise.resolve([GENERATION, 'miss', '']) });
     const cache = createFencedCache({
       redis: stub.commands,
       namespace: NAMESPACE,
@@ -113,7 +110,7 @@ describe('fail-closed behaviour when Redis misbehaves', () => {
 
   it('skips the write entirely when the cache read fails after the generation was captured', async () => {
     const stub = createStubRedis({
-      read: () => Promise.resolve(['7', 'freshError', REDIS_DOWN.message]),
+      read: () => Promise.resolve([GENERATION, 'freshError', REDIS_DOWN.message]),
     });
     const cache = createFencedCache({
       redis: stub.commands,
@@ -132,13 +129,13 @@ describe('fail-closed behaviour when Redis misbehaves', () => {
 
   it('throws instead of suppressing on the low-level surfaces', async () => {
     const writeBroken = createFencedCache({
-      redis: createStubRedis({ get: () => Promise.resolve(null) }).commands,
+      redis: createStubRedis().commands,
       namespace: NAMESPACE,
       onError: (event) => events.push(event),
     });
-    await expect(writeBroken.setIfGeneration(KEY, 'computed', 0, { ttlMs: TTL_MS })).rejects.toBe(
-      REDIS_DOWN,
-    );
+    await expect(
+      writeBroken.setIfGeneration(KEY, 'computed', GENERATION, { ttlMs: TTL_MS }),
+    ).rejects.toBe(REDIS_DOWN);
 
     const counterBroken = createFencedCache({
       redis: createStubRedis().commands,
@@ -153,7 +150,7 @@ describe('fail-closed behaviour when Redis misbehaves', () => {
   });
 
   it('bypasses caching when the snapshot response is malformed', async () => {
-    const stub = createStubRedis({ read: () => Promise.resolve(['0', 'fresh', 42]) });
+    const stub = createStubRedis({ read: () => Promise.resolve([GENERATION, 'fresh', 42]) });
     const cache = createFencedCache({
       redis: stub.commands,
       namespace: NAMESPACE,
@@ -171,7 +168,7 @@ describe('fail-closed behaviour when Redis misbehaves', () => {
 
   it('survives an onError handler that throws, without leaking an unhandled rejection', async () => {
     const handlerFailure = new Error('the error handler itself is broken');
-    const stub = createStubRedis({ read: () => Promise.resolve(['0', 'miss', '']) });
+    const stub = createStubRedis({ read: () => Promise.resolve([GENERATION, 'miss', '']) });
     const cache = createFencedCache({
       redis: stub.commands,
       namespace: NAMESPACE,

@@ -1,89 +1,10 @@
 # cache-fence
 
-Generation-fenced Redis cache for Node.js: it blocks the stale write that lands *after* your invalidation, by rejecting it atomically inside Redis.
+Generation-fenced Redis cache for Node.js. It rejects writes whose computation crossed an invalidation,
+and verifies cached values against the current generation before returning them.
 
-- Zero runtime dependencies. Redis client is an optional peer.
-- One narrow job. Use it next to the cache library you already have.
-- The guarantee is exercised against a real Redis server, not a mock — see [30-second proof](#30-second-proof).
-
-## The problem: stale resurrection
-
-Any backend that combines a Redis cache with explicit invalidation (delete the key on mutation) can hit this
-timeline:
-
-```text
-        request A                       mutation                    redis
-            |                              |                          |
- t0  -------+ GET works:list -> MISS       |                          |
-            | start slow compute (3s)      |                          |
-            |                              |                          |
- t1  -------+------------------------------+ DEL works:list --------> key removed (correct)
-            |                              |                          |
- t2  -------+ compute finished ------------+---- SET works:list ----> pre-t1 data is back
-            |                              |                          |
-     -------+------------------------------+--------------------------+---->
-                    every reader now gets pre-mutation data, until the next
-                    invalidation or the TTL expires
-```
-
-The write at `t2` carries data that was read *before* the mutation, and it lands *after* the invalidation. It
-resurrects exactly what the invalidation just removed.
-
-The reason no amount of deleting fixes this: **delete-based invalidation can only delete keys that exist at the
-moment it runs. It cannot stop a write that has not arrived yet.**
-
-Two terms, used consistently throughout this README and the source:
-
-- **Stale resurrection** — the phenomenon: invalidated data reappears in the cache and is served as if fresh.
-- **Invalidation-crossing write** — the cause: a write whose computation started before an invalidation and
-  whose `SET` completes after it.
-
-The window is exactly as wide as your slowest computation, and it opens on every mutation that races one. It is
-rare per request, structural in aggregate, and close to impossible to diagnose from the outside: the cache
-contains a value that was true at some point, just not now.
-
-## Why common techniques don't stop it
-
-| Technique | Why the invalidation-crossing write still lands |
-| --- | --- |
-| TTL | Bounds how long the stale value is served. Does not prevent the resurrection. |
-| stale-while-revalidate | Background refreshes make slow computations more frequent, which *widens* the crossing window. |
-| single-flight / request coalescing | Removes duplicate concurrent computations. Says nothing about a computation crossing an invalidation. |
-| Tag or pattern deletion | Same limit as a single `DEL`: it clears what exists now, not what arrives next. |
-| Distributed lock around the computation | Serializes computations, and makes invalidation queue behind the lock. Trades one problem for another. |
-
-These are all worth having. None of them is about ordering a write against an invalidation, which is the only
-thing that stops stale resurrection.
-
-## How cache-fence stops it
-
-Generation fencing:
-
-1. **A monotonic counter per namespace.** One Redis integer key, the namespace's *generation*.
-2. **The generation is captured when the computation starts** — before the cache read, before the loader runs.
-3. **Invalidation bumps the generation first, then sweeps the keys** (`INCR`, then `SCAN` + `UNLINK`).
-4. **Every write is an atomic compare-and-set.** A Lua script reads the counter and writes the value only if the
-   generation still matches the one the computation captured. If it moved, the script writes nothing and returns
-   0. The whole check-and-write is one Redis command, so no invalidation can interleave with it.
-
-The bump-then-sweep order is what makes invalidation complete, and it gives two independent safety nets:
-
-- A write that arrives **after** the bump is rejected by the compare-and-set — its generation is behind.
-- A write that slipped in **just before** the bump is removed by the sweep that follows.
-
-The same timeline as above, fenced:
-
-```text
- t0  request A: generation() -> 7, MISS, slow compute starts
- t1  invalidate(): INCR gen -> 8, then SCAN + UNLINK the namespace
- t2  request A finishes, writes with generation 7
-     Lua: current generation is 8, 8 != 7 -> return 0, nothing written
-     -> next reader misses and computes post-mutation data
-```
-
-An invalidation-crossing write is therefore never observable: it is either rejected by the compare-and-set or
-removed by the sweep. A rejected write is not an error — it means the value was known to be stale before it was
-ever visible, which is the outcome you wanted.
+Zero runtime dependencies. Bring a node-redis client or a small adapter. Fresh and stale lookups each take
+one atomic Redis round trip; concurrent computations share work within one cache instance.
 
 ## Install
 
@@ -91,9 +12,11 @@ ever visible, which is the outcome you wanted.
 npm install cache-fence redis
 ```
 
-Node.js >= 22. `redis` (node-redis) `>=5.0.0 <7` is an **optional** peer dependency — bring your own client, or
-adapt another one through the five-method interface in [Redis client adapter](#redis-client-adapter).
-cache-fence itself has no runtime dependencies.
+Node.js >= 22. `redis` (node-redis) `>=5.0.0 <7` is an optional peer dependency.
+The test suite runs against Redis 7 in isolated Docker containers, including a three-master Redis Cluster.
+
+**Upgrading from 0.1.x:** 0.2.0 changes generation types and Redis storage. Read [Migration](#migration-from-01x)
+before deploying readers or invalidators.
 
 ## Quickstart
 
@@ -102,334 +25,289 @@ import { createClient } from 'redis';
 import { createFencedCache } from 'cache-fence';
 
 const redis = createClient({ url: process.env.REDIS_URL });
+redis.on('error', (error) => logger.warn({ error }, 'Redis connection error'));
 await redis.connect();
 
-const cache = createFencedCache({ redis, namespace: 'catalog' });
-
-// Read-through. The generation is captured before the cache read; the write-back at the
-// end is fenced against it. Concurrent callers for the same key share one computation.
-const works = await cache.getOrCompute('works:list', () => db.listPublishedWorks(), {
-  ttlMs: 60_000,
-});
-
-// On mutation: bump the generation, then sweep the namespace.
-await cache.invalidate();
-```
-
-Stale-while-revalidate is one option away. The background refresh goes through the same fence:
-
-```ts
-const works = await cache.getOrCompute('works:list', () => db.listPublishedWorks(), {
-  ttlMs: 60_000,
-  staleTtlMs: 600_000, // serve stale up to 10 min while refreshing behind the fence
-});
-```
-
-Note what is *not* in this code: generation values. On the high-level path you never read, pass, or store one.
-Capture, comparison and rejection happen inside `getOrCompute`. The low-level API exists for the cases it does
-not cover, and is described [below](#low-level-api).
-
-## 30-second proof
-
-The claim is testable, so test it:
-
-```sh
-git clone https://github.com/emulette/cache-fence.git && cd cache-fence
-npm install
-npm test          # requires Docker: spins up a real Redis via testcontainers
-```
-
-`test/race.test.ts` does both halves against a real Redis server:
-
-1. It **reproduces** stale resurrection with an unfenced cache — plain `GET` / `SET` / `DEL`, the pattern every
-   cache library implements — and asserts that the deleted value is back in Redis after the late write.
-2. It runs the **same interleaving** through cache-fence and asserts the write was rejected: the compare-and-set
-   returns 0, the key stays absent, and the next read recomputes.
-
-No mocked Redis, no mocked Lua.
-
-## API reference
-
-Everything the package exports:
-
-```ts
-import {
-  createFencedCache,   // factory
-  FencedCache,         // the class, if you prefer `new`
-  FENCED_CACHE_ERRORS, // error message constants
-} from 'cache-fence';
-
-import type {
-  FencedCacheOptions,
-  GetOrComputeOptions,
-  InvalidationResult,
-  FencedCacheErrorEvent,
-  FencedCacheEvent,
-  FencedCacheOperation,
-  RedisCommands,
-  Serializer,
-} from 'cache-fence';
-```
-
-### `createFencedCache(options): FencedCache`
-
-| Option | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `redis` | `RedisCommands` | — | Client, or adapter. See below. |
-| `namespace` | `string` | — | Groups keys under one generation counter. Non-empty, and must not contain `*`, `{` or `}` (it becomes a cluster hash tag). Invalid values throw from the constructor. |
-| `scanCount` | `number` | `1000` | `COUNT` hint for the invalidation `SCAN`. |
-| `unlinkBatchSize` | `number` | `1000` | Keys per `UNLINK` call during the sweep. |
-| `serializer` | `Serializer` | JSON | `{ serialize(value: unknown): string; deserialize(raw: string): unknown }`. |
-| `onError` | `(event: FencedCacheErrorEvent) => void` | — | Receives errors the cache suppressed. Exceptions thrown by the handler are ignored. |
-| `onEvent` | `(event: FencedCacheEvent) => void` | — | Receives cache outcomes for metrics or logging. Exceptions thrown by the handler are ignored. |
-
-Key layout, for the namespace `catalog`:
-
-```text
-{catalog}:gen        generation counter (outside the data prefix, so a sweep cannot delete it)
-{catalog}:k:f:<key>  fresh entry
-{catalog}:k:s:<key>  stale entry (only when staleTtlMs is set)
-```
-
-The sweep matches `{catalog}:k:*`, which is why the counter lives outside that prefix. Accepted namespace
-characters such as `?`, `[` and `\` are escaped in the scan pattern and always matched literally.
-
-### `getOrCompute<T>(key, loader, options): Promise<T>`
-
-`options`: `{ ttlMs: number; staleTtlMs?: number }`. Both must be positive integers; `staleTtlMs` enables
-stale-while-revalidate and should exceed `ttlMs`.
-
-Sequence: one Lua command captures the generation and reads the fresh entry, consulting the stale entry only
-on a fresh miss with SWR enabled → serve a hit (starting a fenced background refresh for a stale hit) → otherwise
-run `loader` → write back through the fence. Both fresh and stale lookups take one Redis round trip.
-
-- **Single-flight**: concurrent misses for the same key and generation on the same `FencedCache` instance share
-  one computation. Each caller reads the current generation before joining, so a request after a completed
-  invalidation cannot join a pre-invalidation computation, even if another instance performed the invalidation.
-  If the generation cannot be verified, the caller runs its loader independently without caching.
-- **Loader errors propagate.** They are yours; the cache does not swallow them.
-- **A fence rejection is a normal outcome.** The computed value is still returned to the caller without being
-  cached. It produces no error; an optional `onEvent` observer receives `fenceRejected`.
-- A cached `null` is a hit and comes back as `null`.
-- **With SWR**, the background refresh reuses the generation captured when the serving request started, so a
-  refresh spanning an invalidation is rejected too. Refreshes are deduplicated per key and generation, so a new
-  generation can refresh while an old generation's refresh is still running. The stale entry is only written
-  when the fresh write was accepted.
-- **No cancellation or timeout contract.** The loader runs to completion — there is no `AbortSignal` support,
-  and concurrent callers joined to a flight share its outcome. If the computation needs a deadline, enforce it
-  inside the loader.
-
-### `get<T>(key): Promise<T | undefined>`
-
-Reads the fresh entry. `undefined` means a miss (a cached `null` returns `null`). Stale entries are not
-consulted here — only `getOrCompute` serves those. Redis and deserialization errors are thrown.
-
-### Low-level API
-
-The escape hatch, for computations `getOrCompute` doesn't wrap: write paths, jobs, or your own composition. This
-is the library's actual primitive.
-
-```ts
-const gen = await cache.generation();          // 0 for an untouched namespace
-const value = await expensiveComputation();
-const accepted = await cache.setIfGeneration('works:list', value, gen, { ttlMs: 60_000 });
-if (!accepted) {
-  // An invalidation crossed the computation. The value was dropped; this is the fence working.
-}
-```
-
-| Method | Returns | Notes |
-| --- | --- | --- |
-| `generation()` | `Promise<number>` | Current generation; `0` if the counter does not exist. Throws if the counter holds a non-integer. |
-| `setIfGeneration(key, value, generation, { ttlMs })` | `Promise<boolean>` | `true` if written, `false` if the fence rejected it. Serialization and Redis errors are **thrown**, unlike on the `getOrCompute` path. |
-| `bumpGeneration()` | `Promise<number>` | `INCR` on the counter, returns the new generation. Invalidates every generation captured before this call, without touching keys. |
-| `invalidate()` | `Promise<InvalidationResult>` | `{ generation, deletedKeys }`. Bumps, then sweeps. |
-
-`invalidate()` performs bump-then-sweep in that order, deduplicating keys returned more than once by `SCAN` and
-unlinking them in batches. Failures are thrown rather than reported through `onError`: a half-invalidated
-namespace is something the caller must be able to see and retry.
-
-### `FENCED_CACHE_ERRORS`
-
-Every message this library can produce, as functions. Nothing else in the package builds message strings, so
-tests can assert against these instead of hardcoding text: `invalidNamespace`, `invalidGeneration`,
-`invalidReadReply`, `invalidTtl`, `unserializableValue`.
-
-### Observing cache outcomes
-
-`onEvent` is an optional synchronous callback, separate from `onError`. It needs no metrics dependency:
-
-```ts
-const cache = createFencedCache({
-  redis,
-  namespace: 'catalog',
-  onEvent: (event) => logger.debug({ event }, 'cache outcome'),
-});
-```
-
-| `event.type` | Additional fields | When it fires |
-| --- | --- | --- |
-| `hit` | `key`, `source: 'fresh' \| 'stale'` | A `getOrCompute` request returns a cached value. |
-| `miss` | `key` | A `getOrCompute` request has a valid snapshot but no usable cached value. |
-| `fenceRejected` | `key`, `generation`, `entry: 'fresh' \| 'stale'` | A write is rejected, including low-level `setIfGeneration` writes. |
-| `refreshCompleted` | `key`, `generation`, `accepted` | A background refresh finishes its write attempts without an error. `accepted` is false if a fence rejected either copy. |
-
-Keys are the caller's keys without storage prefixes. Hits and misses count requests, even when several misses
-share one loader. Refresh completion and fence rejection count actual work, not callers joined to that work.
-A failed refresh reports through `onError` instead of emitting `refreshCompleted`. A failed or invalid snapshot
-reports `operation: 'generation'` through `onError` and emits no hit or miss. Plain `get()` emits no outcome events.
-Exceptions thrown by the observer are ignored.
-
-### Redis client adapter
-
-The whole Redis surface is five operations, in node-redis v5+ signatures:
-
-```ts
-export interface RedisCommands {
-  get(key: string): Promise<string | null>;
-  incr(key: string): Promise<number>;
-  eval(script: string, options: { keys: string[]; arguments: string[] }): Promise<unknown>;
-  scanIterator(options: { MATCH: string; COUNT: number }): AsyncIterable<string | string[]>;
-  unlink(keys: string[]): Promise<number>;
-}
-```
-
-A node-redis client satisfies this as-is — pass it straight to `createFencedCache`. Any other client, wrapper or
-connection pool is roughly ten lines. The shape, using ioredis names (illustrative, not a shipped adapter):
-
-```ts
-const adapter: RedisCommands = {
-  get: (key) => io.get(key),
-  incr: (key) => io.incr(key),
-  eval: (script, { keys, arguments: args }) => io.eval(script, keys.length, ...keys, ...args),
-  scanIterator: ({ MATCH, COUNT }) => io.scanStream({ match: MATCH, count: COUNT }),
-  unlink: (keys) => io.unlink(...keys),
-};
-```
-
-`scanIterator` may yield single keys or batches; both are handled.
-
-On a Redis Cluster, four of the five operations route themselves: `get` and `incr` are single-key, `eval`
-follows its first key (and both keys the script touches share the `{namespace}` hash tag), and `unlink` only
-ever receives keys from one namespace, hence one slot. The one operation that needs cluster-specific work is
-`scanIterator`: SCAN cursors are per-node state, so the adapter must walk every master and drain each node's
-iterator in turn — scanning a single node would silently leave stale keys on the other masters during an
-invalidation sweep. [`test/cluster-fixture.ts`](test/cluster-fixture.ts) contains a complete node-redis
-cluster adapter following this pattern.
-
-## Failure semantics: fail-closed
-
-When Redis is unreachable, the correct answer is a slow answer, not a fast wrong one. `getOrCompute` degrades to
-**computing without caching** and reports through `onError`. It never serves something it cannot verify.
-
-| Situation | Behavior | `onError` event |
-| --- | --- | --- |
-| Snapshot command fails, its reply is malformed, or the generation is invalid | Run `loader` independently, return the value, cache nothing | `operation: 'generation'` |
-| Fresh read fails | Run `loader`, return the value, skip the write-back | `operation: 'get'` |
-| Stale read fails (SWR) | Fall through to `loader`; the fenced write-back is still attempted | `operation: 'get'` |
-| Write fails (Redis error or serialization) | Value is still returned to the caller | `operation: 'setIfGeneration'` |
-| Background SWR refresh fails | Nothing surfaces to any caller; never an unhandled rejection | `operation: 'swrRefresh'` |
-| **Fence rejects the write** | Value returned, not cached; optional `onEvent` receives `fenceRejected` | **none — this is not an error** |
-| `loader` throws | Propagates to the caller | none |
-
-```ts
 const cache = createFencedCache({
   redis,
   namespace: 'catalog',
   onError: ({ operation, key, error }) => logger.warn({ operation, key, error }, 'cache degraded'),
 });
+
+const works = await cache.getOrCompute('works:list', () => db.listPublishedWorks(), {
+  ttlMs: 60_000,
+});
+
+// After a database mutation commits, invalidate every affected namespace.
+await cache.invalidate();
 ```
 
-Two consequences worth stating explicitly:
+Stale-while-revalidate (SWR) is enabled by adding `staleTtlMs`. It is the total lifetime of the stale copy
+from the write, not additional time after fresh expiry, and should exceed `ttlMs`:
 
-- **The low-level API and `invalidate()` throw instead of degrading.** Callers of a primitive must see failures.
-- **SWR refreshes are fenced like any other write.** Serving stale never means writing unverified data: if an
-  invalidation crossed the refresh, the refresh's write is rejected and the entry simply expires.
+```ts
+const works = await cache.getOrCompute('works:list', () => db.listPublishedWorks(), {
+  ttlMs: 60_000,
+  staleTtlMs: 600_000,
+});
+```
 
-## Design constraints, and what this is not
+A stale hit returns immediately and starts a fenced background refresh. Rotation invalidates both copies;
+SWR never serves a copy from an older generation.
 
-- **Not another cache framework.** No layers, no drivers, no decorators, no key catalog. Competing on a feature
-  matrix would mean becoming the thing this exists to avoid.
-- **Use it alongside your cache library.** cache-manager, cachified, bentocache and friends solve stampedes and
-  SWR well, and none of them fences invalidation-crossing writes. Keep them for the bulk of your cache; put
-  cache-fence on the hot spots where stale data is a bug rather than a delay — inventory, permissions, pricing,
-  publication state.
-- **Zero runtime dependencies.** The Redis client is an optional peer dependency. Nothing else is installed.
-- **Redis-only, by design.** The guarantee is server-side atomicity via Lua. A generic storage adapter cannot
-  promise that, so there isn't one.
-- **Redis Cluster**: the counter and the data keys share the `{namespace}` hash tag, so they land in the same
-  slot and the compare-and-set never hits `CROSSSLOT`. The test suite verifies this against a live three-master
-  cluster — including a `CROSSSLOT` negative control and a cross-master invalidation sweep
-  (`CLUSTER_TESTS=1 npm run test:cluster`). Failover, resharding and replica reads are not covered. The cluster
-  `scanIterator` adapter pattern is described in [Redis client adapter](#redis-client-adapter).
-- **One generation per namespace.** Invalidation is namespace-wide by construction. Use narrower namespaces for
-  narrower blast radius.
-- **In-process single-flight.** Deduplicates within one process. Cross-process stampede control is not this
-  library's job; the fence is orthogonal to it.
+## How fencing works
 
-## Prior art
+Deleting a key cannot prevent a slow computation from writing old data back after the deletion:
 
-The mechanism has been proven for over a decade. What did not exist is a general-purpose package for Redis and
-Node.
+```text
+A: cache miss, starts computing old data
+B: database mutation commits, invalidates cache
+A: finishes, attempts to cache old data
+```
 
-- **Facebook memcache leases** (NSDI 2013) — the same idea: a token issued on miss, invalidated on write, used to
-  reject stale set-backs. Implemented inside the memcached server, so not portable to Redis.
-- **Martin Kleppmann's fencing tokens** (2016) — the same ordering argument, formalized for distributed locks and
-  shared storage rather than caches.
-- **Uber CacheFront** — Lua compare-and-set rejection keyed on row timestamps, operated at very large read
-  volume. Internal infrastructure, not a published library.
+cache-fence coordinates those operations with an opaque UUID generation token:
 
-cache-fence packages that mechanism for Redis and Node, with an explicit compare-and-set API rather than an
-implicit one.
+1. A Lua read atomically initializes missing generation metadata, reads the entry and checks its stamp.
+2. The loader runs with that captured token. A Lua compare-and-set accepts its write only if the token still
+   matches Redis. Missing metadata rejects the write.
+3. Invalidation rotates the token first. Old entries immediately become cache misses, including entries
+   whose cleanup has not started or fails.
+4. SCAN finds data keys; a bounded Lua cleanup checks their stamps and unlinks obsolete entries atomically.
+   A new-generation write that replaces a scanned key is preserved.
 
-## Performance
+Tokens come from `node:crypto.randomUUID()`. They are equality tokens, not ordered counters. Generation
+initialization and rotation use fresh UUIDs, avoiding the reset-to-zero problem when metadata is evicted,
+expires, is deleted, or Redis is flushed. As with other random identifiers, uniqueness relies on UUID collision
+resistance. Surviving data with a different stamp is ignored; new requests cannot join pre-loss computations.
 
-The price of the guarantee, measured (`node bench/run.mjs`: Redis 7 in local Docker, sequential operations on
-one connection — absolute numbers are dominated by loopback round-trip time and vary by machine; the ratios
-are the signal):
+A cache read is verified at the instant its Lua command executes. A request already in progress can still
+return its earlier cached or computed value after invalidation. The fence controls cache reads and writes;
+it does not cancel in-flight responses or make the database and Redis one transaction.
 
-| operation | p50 µs | mean µs | vs unfenced (p50) |
-| --- | ---: | ---: | ---: |
-| `setIfGeneration` (fenced write, Lua CAS) | 93.6 | 98.1 | +5.9% |
-| plain `SET` with TTL (baseline) | 88.3 | 93.4 | — |
-| `getOrCompute` cache hit (1 round trip) | 93.8 | 100.9 | +9.0% |
-| raw `GET` (baseline, 1 round trip) | 86.0 | 91.2 | — |
+## API
 
-- A fenced write stays one round trip: the ~6% is the Lua interpreter plus a server-side counter `GET`.
-- A fenced cache hit reads the generation and value atomically in one round trip. In a same-machine comparison,
-  v0.1.1 measured 169.2 µs p50 and v0.1.2 measured 93.8 µs, about 45% lower latency. This is a local measurement,
-  not a universal speedup; see the benchmark caveats.
-- Invalidating a 10,000-key namespace takes ~9.6 ms (~1M keys/s). Note that `SCAN` traverses the whole
-  keyspace, not just the namespace, so sweep time scales with total database size.
+```ts
+import { createFencedCache, FencedCache, FENCED_CACHE_ERRORS } from 'cache-fence';
+import type {
+  FencedCacheOptions, GetOrComputeOptions, GenerationToken, FencedCacheResult,
+  InvalidationResult, FencedCacheErrorEvent, FencedCacheEvent, FencedCacheOperation,
+  RedisCommands, Serializer,
+} from 'cache-fence';
+```
 
-Methodology, caveats and reproduction: [bench/](bench/).
+### `createFencedCache(options): FencedCache`
 
-## Status
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `redis` | required | Client or `RedisCommands` adapter. |
+| `namespace` | required | Non-empty string without `*`, `{` or `}`; groups invalidation and forms the Redis Cluster hash tag. |
+| `scanCount` | `1000` | COUNT hint for invalidation SCAN. |
+| `unlinkBatchSize` | `1000` | Maximum data keys checked in each atomic cleanup script. |
+| `serializer` | JSON | `{ serialize(value: unknown): string; deserialize(raw: string): unknown }`. Receives the payload without its internal stamp. |
+| `onError` | none | Synchronous callback for suppressed errors. Handler exceptions are ignored. |
+| `onEvent` | none | Synchronous callback for cache outcomes. Handler exceptions are ignored. |
 
-**v0.1.x, pre-1.0.** The API surface is deliberately small, but it may still change before 1.0.
+### `getOrCompute<T>(key, loader, options): Promise<T>`
 
-The fencing mechanism is derived from a pattern running in a production backend; this *package* is new, and does
-not yet have a production track record of its own. What can be checked today is the guarantee itself: every
-claim in this README is exercised by the test suite against a real Redis server — and a real Redis Cluster.
+`options`: `{ ttlMs: number; staleTtlMs?: number }`. TTLs must be positive integer milliseconds.
+Returns a verified fresh/stale hit, or runs `loader` and attempts a fenced write. A cached `null` is a hit.
+Loader errors and invalid options propagate; cache failures are reported through `onError` while the computed
+value is still returned. A rejected write also returns the computed value.
 
-Known limitations:
+Concurrent misses for the same key and generation share a loader and write outcome on one `FencedCache`
+instance. Both read APIs below share these computation flights. Use consistent loaders, value types and TTLs
+for a key: joined callers use the initiating caller's loader/options. SWR refreshes use a separate flight map.
+If no generation can be verified, each request computes independently without caching.
 
-- `getOrCompute` has no cancellation or timeout contract: the loader can run unboundedly, there is no
-  `AbortSignal`, and concurrent callers joined to a flight share its outcome.
-- Cluster failover, resharding and replica reads are untested — see
-  [Design constraints](#design-constraints-and-what-this-is-not).
+### `getOrComputeResult<T>(key, loader, options): Promise<FencedCacheResult<T>>`
 
-Issues and PRs are welcome, particularly reproductions of stale resurrection in real systems.
+Same behavior as `getOrCompute`, with a per-call outcome:
+
+```ts
+const result = await cache.getOrComputeResult('works:list', () => db.listPublishedWorks(), {
+  ttlMs: 60_000,
+});
+
+// An application can use this outcome to decide whether to allow response caching.
+if (result.source === 'computed' && result.write !== 'accepted') {
+  response.setHeader('Cache-Control', 'no-store');
+}
+return result.value;
+```
+
+| Field | Values | Meaning |
+| --- | --- | --- |
+| `value` | `T` | Returned cached or computed value. |
+| `source` | `fresh`, `stale`, `computed` | Origin of this response. |
+| `generation` | `GenerationToken` or `null` | Captured token; `null` when the snapshot could not be verified. |
+| `write` | `not-attempted` | Fresh/stale hit; no foreground write. |
+| `write` | `accepted` | All requested foreground writes were accepted. |
+| `write` | `rejected` | A foreground write failed the generation check. |
+| `write` | `failed` | Serialization, Redis or reply validation failed during write-back. |
+| `write` | `skipped` | The snapshot or fresh entry could not be trusted; no write attempted. |
+
+For a stale hit, `write` describes only the serving request. Its background refresh reports through
+`onEvent`/`onError`. Fresh and stale copies are separate fenced writes: invalidation can reject the second,
+and an error can occur after the first was accepted. `failed` does not prove that nothing reached Redis.
+An `accepted` result does not promise future validity or authorize indefinite caching elsewhere: HTTP, CDN,
+framework and in-process caches need their own coordinated invalidation.
+
+### Low-level methods
+
+```ts
+const generation = await cache.generation(); // opaque GenerationToken; never construct one
+const value = await expensiveComputation();
+const accepted = await cache.setIfGeneration('report', value, generation, { ttlMs: 60_000 });
+```
+
+| Method | Returns | Behavior |
+| --- | --- | --- |
+| `get<T>(key)` | `Promise<T \| undefined>` | Atomically verifies a fresh entry. Miss is `undefined`; cached `null` remains `null`. Does not serve stale or emit events. |
+| `generation()` | `Promise<GenerationToken>` | Returns or atomically initializes the current token; malformed metadata throws. |
+| `setIfGeneration(key, value, generation, { ttlMs })` | `Promise<boolean>` | Accepts only a still-current token. Missing metadata rejects the write. Invalid token input throws. |
+| `bumpGeneration()` | `Promise<GenerationToken>` | Rotates the token, invalidating previous reads/writes without scanning data keys. |
+| `invalidate()` | `Promise<InvalidationResult>` | Rotates, then reclaims obsolete entries; returns `{ generation, deletedKeys }`. |
+
+These methods throw Redis and serialization errors rather than suppressing them. Once rotation succeeds,
+cleanup failure cannot make old entries readable again. `invalidate()` still throws so cleanup failures can
+be observed and retried; retrying rotates again. `deletedKeys` counts actual deletions, excluding preserved
+current entries. Concurrent invalidations may rotate again before a prior call returns.
+
+### Observations and failures
+
+| `event.type` | Fields | Meaning |
+| --- | --- | --- |
+| `hit` | `key`, `source: 'fresh' \| 'stale'` | Request returned a cached value. |
+| `miss` | `key` | Valid snapshot with no usable value. |
+| `fenceRejected` | `key`, `generation`, `entry: 'fresh' \| 'stale'` | Write was rejected, including low-level writes. |
+| `refreshCompleted` | `key`, `generation`, `accepted` | Background refresh finished its write attempts without an error. |
+
+Hits and misses count requests. Rejections and refresh completion count actual work, including shared work
+only once. Events use caller keys without storage prefixes. A fence rejection is an expected outcome and
+does not emit `onError`.
+
+| Failure | High-level behavior | `onError.operation` |
+| --- | --- | --- |
+| Snapshot unavailable, malformed, or invalid generation | Compute independently; skip writes; emit no hit/miss event | `generation` |
+| Fresh read/deserialization fails | Compute; skip writes | `get` |
+| Stale read/deserialization fails | Compute; attempt fenced writes | `get` |
+| Write or serialization fails | Return computed value | `setIfGeneration` |
+| Background loader/write fails | Report once per refresh flight; no unhandled rejection | `swrRefresh` |
+| Foreground loader fails | Reject caller's promise | none |
+
+Library-owned error messages live in `FENCED_CACHE_ERRORS`: `invalidNamespace`, `invalidGeneration`,
+`invalidReadReply`, `invalidWriteReply`, `invalidSweepReply`, `invalidTtl`, `unserializableValue`.
+Redis and serializer error messages are preserved.
+
+## Redis storage and adapter
+
+```text
+{catalog}:v2:gen         opaque generation token; no TTL
+{catalog}:v2:k:f:<key>   fresh entry with TTL
+{catalog}:v2:k:s:<key>   stale entry with TTL, when enabled
+```
+
+Entries contain `generation + '\n' + serializedPayload`. Custom serializers only see the payload. Treat this
+layout as library-owned storage. The version prefix isolates the 0.2 format from older raw payloads.
+Namespace glob characters such as `?`, brackets and `\` are escaped in SCAN patterns.
+
+The adapter needs two operations with node-redis v5+ signatures:
+
+```ts
+export interface RedisCommands {
+  eval(script: string, options: { keys: string[]; arguments: string[] }): Promise<unknown>;
+  scanIterator(options: { MATCH: string; COUNT: number }): AsyncIterable<string | string[]>;
+}
+```
+
+Pass a standalone node-redis client directly. An illustrative ioredis adapter:
+
+```ts
+const adapter: RedisCommands = {
+  eval: (script, { keys, arguments: args }) => io.eval(script, keys.length, ...keys, ...args),
+  scanIterator: ({ MATCH, COUNT }) => io.scanStream({ match: MATCH, count: COUNT }),
+};
+```
+
+All scripts must run against a **writable primary**, including reads because they can initialize missing
+metadata. Redis permissions must allow `EVAL`, `GET`, `SET`, `GETRANGE`, `UNLINK` and `SCAN`, with access to
+all keys in the chosen namespaces. Configure connection deadlines and reconnection behavior in the client.
+
+For Redis Cluster, every key a script touches shares the `{namespace}` hash tag. EVAL routes by its first
+key. SCAN cursors belong to individual nodes: the adapter must visit every primary or target the primary
+owning the namespace. [test/cluster-fixture.ts](test/cluster-fixture.ts) contains a complete adapter that walks
+all masters. An incomplete scan leaks obsolete entries until their TTL expires, but verified reads still
+reject them after generation rotation.
+
+## Migration from 0.1.x
+
+0.2.0 is a breaking release. Prepare a coordinated cutover:
+
+1. Replace numeric generation annotations with `GenerationToken`. Remove hardcoded `0`, arithmetic and
+   ordering comparisons. Capture tokens through the cache and pass them back unchanged.
+2. Update explicit adapter object literals to the two-method interface and grant the commands above in ACLs.
+   A standalone node-redis client remains directly compatible.
+3. Upgrade **all readers, mutation handlers and background invalidators for a namespace together**. Drain old
+   processes/jobs before enabling the new version. The two storage versions are isolated: a 0.1 invalidator
+   cannot invalidate 0.2 entries and vice versa. An ordinary mixed-version rolling deployment does not provide
+   coordinated invalidation; arrange it at the application deployment layer if overlap is required.
+4. Expect a cold cache. Old data keys expire on their existing TTLs; old generation counters have no TTL.
+   After all old processes/jobs have stopped, old counters may be removed through application operations.
+   Do not copy old counters or raw payloads into the new prefix.
+5. After restoring an older Redis snapshot or rolling back the application, drain work and rotate every
+   affected namespace before serving traffic. A previously used prefix may still contain old entries.
+
+## Operating boundaries
+
+- Invalidate after database commit on every mutation path, including jobs and imports. A loader that reads
+  an already-stale database replica can still produce stale data with a current token.
+- Use stable namespaces scoped to the data that must be invalidated together. One namespace occupies one
+  Redis Cluster slot and retains one metadata key until removed or evicted.
+- Memory eviction is supported, including loss of generation metadata under `allkeys-lru`. It can reduce the
+  hit rate by invalidating otherwise surviving entries. For dedicated cache Redis, TTL-only eviction policies
+  can retain metadata; size memory and choose policy for the actual workload. The library sets TTLs on data.
+- Loss of keys and full resets are handled; **rollback to an older surviving token is different**. Snapshot
+  restore or replication failover that loses an acknowledged invalidation can restore a previously valid
+  token. The library cannot detect that history loss. Rotate after a controlled restore; stronger durability
+  across failover requires an external coordination/durability design. Failover, resharding and replica reads
+  are not covered by the cluster tests.
+- Single-flight is per instance/process. There is no distributed lock, loader timeout or cancellation API.
+  Apply deadlines inside the loader; concurrent callers share its outcome.
+- SCAN covers the database keyspace. Cleanup cost grows with total database size; `bumpGeneration()` can make
+  entries unreadable immediately when physical reclamation can wait for their TTLs.
+
+## Verification and performance
+
+With Docker running:
+
+```sh
+npm ci
+npm run typecheck
+npm run lint
+npm test
+npm run test:cluster
+npm run build
+npm run test:consumer
+node bench/run.mjs
+```
+
+The tests reproduce an unfenced resurrection and exercise real Redis fencing, metadata loss/eviction,
+failed cleanup, concurrent replacement, SWR, serialization, per-call results and Cluster slot routing.
+Consumer checks install a packed tarball and run both ESM and CJS entry points against Redis.
+
+A local 0.2.0 run on 2026-09-08 (Apple M4 Pro, Node 26.5.0, Redis 7.4.10 in Docker) measured:
+
+| Operation | p50 µs | Mean µs |
+| --- | ---: | ---: |
+| Fenced write | 98.4 | 107.7 |
+| Plain SET with TTL | 91.9 | 99.1 |
+| Verified cache hit | 100.8 | 114.8 |
+| Raw GET + JSON.parse | 90.3 | 109.2 |
+
+The 10,000-key cleanup median was **17.1 ms** across three rounds. These are local latency measurements,
+not production capacity estimates. [bench/](bench/) documents the workload, added stamp cost and caveats.
 
 ## License
 
-Licensed under either of
-
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-
-at your option.
-
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this work by
-you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or
-conditions.
+Licensed under either [MIT](LICENSE-MIT) or [Apache License, Version 2.0](LICENSE-APACHE), at your option.
+Unless explicitly stated otherwise, contributions are dual licensed under the same terms.

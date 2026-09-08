@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-08
+
+### Breaking changes
+
+- Replace numeric counters with opaque `GenerationToken` UUIDs. `generation()`
+  initializes missing metadata atomically; `bumpGeneration()` rotates the token.
+  Token loss no longer permits writes captured before invalidation or data loss.
+- Use versioned `{namespace}:v2:gen` and `{namespace}:v2:k:*` keys. Values carry a
+  generation stamp; every read verifies it atomically before returning the payload.
+  Upgrade all readers and invalidators together; 0.1.x and 0.2.x do not invalidate
+  each other's storage. See the README migration procedure.
+- Reduce the Redis adapter to `eval` and `scanIterator`. Lua now also uses `GETRANGE`
+  for cleanup. Adapters and ACLs must support the documented command set.
+
+### Fixed
+
+- Generation rotation immediately makes old fresh and SWR entries unreadable,
+  including when a cleanup fails or has not yet reached the entry.
+- Cleanup atomically checks entry stamps and preserves current-generation writes
+  that replace keys between SCAN and deletion.
+- Generation loss and full Redis resets start distinct computation and refresh
+  flights, preventing new requests from joining pre-loss work.
+
+### Added
+
+- `getOrComputeResult<T>()` and `FencedCacheResult<T>` expose the value, source,
+  captured generation and write outcome per call. `getOrCompute()` retains its
+  value-only API and shares the same computation flights.
+- Behavioral regression coverage for metadata loss, memory eviction, incomplete
+  invalidation, concurrent cleanup and result/error semantics.
+
 ## [0.1.2] - 2026-09-08
 
 ### Fixed

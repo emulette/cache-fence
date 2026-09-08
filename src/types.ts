@@ -2,15 +2,15 @@
  * The minimal Redis surface this library needs, using node-redis v5+ signatures.
  *
  * A node-redis client satisfies it as-is. Other clients (ioredis, wrappers,
- * connection pools) are adapted by supplying these five operations.
+ * connection pools) are adapted by supplying these two operations.
  */
 export interface RedisCommands {
-  get(key: string): Promise<string | null>;
-  incr(key: string): Promise<number>;
   eval(script: string, options: { keys: string[]; arguments: string[] }): Promise<unknown>;
   scanIterator(options: { MATCH: string; COUNT: number }): AsyncIterable<string | string[]>;
-  unlink(keys: string[]): Promise<number>;
 }
+
+/** Opaque equality token. Obtain it from the cache; do not construct or order tokens. */
+export type GenerationToken = string & { readonly __generationToken: unique symbol };
 
 /** Converts cached values to and from the strings Redis stores. Defaults to JSON. */
 export interface Serializer {
@@ -26,7 +26,7 @@ export type FencedCacheOperation = 'generation' | 'get' | 'setIfGeneration' | 's
  * write while Redis is unreachable or a failed background refresh.
  *
  * A fence rejection is not an error and never produces an error event: it means an
- * invalidation crossed the computation and the write was correctly dropped.
+ * invalidation or metadata loss crossed the computation and the write was dropped.
  */
 export interface FencedCacheErrorEvent {
   operation: FencedCacheOperation;
@@ -39,19 +39,19 @@ export interface FencedCacheErrorEvent {
 export type FencedCacheEvent =
   | { type: 'hit'; key: string; source: 'fresh' | 'stale' }
   | { type: 'miss'; key: string }
-  | { type: 'fenceRejected'; key: string; generation: number; entry: 'fresh' | 'stale' }
-  | { type: 'refreshCompleted'; key: string; generation: number; accepted: boolean };
+  | { type: 'fenceRejected'; key: string; generation: GenerationToken; entry: 'fresh' | 'stale' }
+  | { type: 'refreshCompleted'; key: string; generation: GenerationToken; accepted: boolean };
 
 export interface FencedCacheOptions {
   redis: RedisCommands;
   /**
-   * Groups keys under one generation counter. Used as the `{namespace}` cluster
+   * Groups keys under one generation token. Used as the `{namespace}` cluster
    * hash tag, so it must not contain `*`, `{` or `}`.
    */
   namespace: string;
   /** COUNT hint for the invalidation SCAN. Default 1000. */
   scanCount?: number;
-  /** Keys per UNLINK call during invalidation. Default 1000. */
+  /** Keys per atomic cleanup script during invalidation. Default 1000. */
   unlinkBatchSize?: number;
   /** Default: JSON. */
   serializer?: Serializer;
@@ -72,9 +72,21 @@ export interface GetOrComputeOptions {
   staleTtlMs?: number;
 }
 
+/** Outcome observed by this call; it does not guarantee future validity in another cache. */
+export type FencedCacheResult<T> =
+  | { value: T; source: 'fresh' | 'stale'; generation: GenerationToken; write: 'not-attempted' }
+  | {
+      value: T;
+      source: 'computed';
+      /** Null when the Redis snapshot could not be verified. */
+      generation: GenerationToken | null;
+      /** A failed write may have reached Redis before the error was observed. */
+      write: 'accepted' | 'rejected' | 'failed' | 'skipped';
+    };
+
 export interface InvalidationResult {
   /** Generation the namespace moved to. */
-  generation: number;
+  generation: GenerationToken;
   /** Keys removed by the sweep. */
   deletedKeys: number;
 }

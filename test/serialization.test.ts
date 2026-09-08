@@ -3,6 +3,7 @@ import {
   createFencedCache,
   FENCED_CACHE_ERRORS,
   type FencedCacheErrorEvent,
+  type GenerationToken,
   type Serializer,
 } from '../src/index';
 import { startRedisFixture, storageKeys, type RedisFixture } from './redis-fixture';
@@ -77,10 +78,37 @@ describe('serialization and input validation', () => {
     await cache.getOrCompute(KEY, async () => WORK, { ttlMs: TTL_MS });
 
     const stored = await fx.raw.get(storageKeys.fresh(NAMESPACE, KEY));
-    expect(stored).toBe(`${TAG}${JSON.stringify(WORK)}`);
+    expect(stored).toBe(`${await cache.generation()}\n${TAG}${JSON.stringify(WORK)}`);
     // The read path goes back through the same serializer, tag and all.
     expect(await cache.get<Work>(KEY)).toEqual(WORK);
   });
+
+  it('preserves newlines, null bytes and Unicode inside a custom serialized payload', async () => {
+    const payload = '\n캐시\u0000\nvalue';
+    const cache = createFencedCache({
+      redis: fx.commands,
+      namespace: NAMESPACE,
+      serializer: {
+        serialize: (value) => String(value),
+        deserialize: (raw) => raw,
+      },
+    });
+    await cache.setIfGeneration(KEY, payload, await cache.generation(), { ttlMs: TTL_MS });
+    expect(await cache.get(KEY)).toBe(payload);
+  });
+
+  it.each([0, '', '0', 'not-a-token'])(
+    'rejects an invalid generation from a JavaScript caller: %s',
+    async (generation) => {
+      const cache = createFencedCache({ redis: fx.commands, namespace: NAMESPACE });
+      await expect(
+        cache.setIfGeneration(KEY, WORK, generation as unknown as GenerationToken, {
+          ttlMs: TTL_MS,
+        }),
+      ).rejects.toThrow(FENCED_CACHE_ERRORS.invalidGeneration(generation));
+      expect(await cache.get(KEY)).toBeUndefined();
+    },
+  );
 
   it('throws from setIfGeneration when a value has no serialized form', async () => {
     const cache = createFencedCache({ redis: fx.commands, namespace: NAMESPACE });
@@ -133,9 +161,9 @@ describe('serialization and input validation', () => {
     await expect(
       cache.getOrCompute(KEY, async () => WORK, { ttlMs: TTL_MS, staleTtlMs: 0 }),
     ).rejects.toThrow(FENCED_CACHE_ERRORS.invalidTtl('staleTtlMs', 0));
-    await expect(cache.setIfGeneration(KEY, WORK, 0, { ttlMs: -1 })).rejects.toThrow(
-      FENCED_CACHE_ERRORS.invalidTtl('ttlMs', -1),
-    );
+    await expect(
+      cache.setIfGeneration(KEY, WORK, await cache.generation(), { ttlMs: -1 }),
+    ).rejects.toThrow(FENCED_CACHE_ERRORS.invalidTtl('ttlMs', -1));
 
     expect(await cache.get(KEY)).toBeUndefined();
   });

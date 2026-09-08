@@ -1,6 +1,6 @@
 {
   "name": "cache-fence",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Generation-fenced Redis cache: atomically rejects stale writes that cross an invalidation",
   "license": "MIT OR Apache-2.0",
   "type": "module",

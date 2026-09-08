@@ -5,6 +5,8 @@ export type {
   FencedCacheEvent,
   FencedCacheOperation,
   FencedCacheOptions,
+  FencedCacheResult,
+  GenerationToken,
   GetOrComputeOptions,
   InvalidationResult,
   RedisCommands,

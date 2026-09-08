@@ -74,18 +74,18 @@ const ASSERTIONS_SOURCE = [
   "    '[' + label + '] a cached hit must return the cached value',",
   '  );',
   '',
-  '  // invalidate() must bump the generation.',
+  '  // invalidate() must rotate the opaque token.',
   '  const generationBefore = await cache.generation();',
   '  const invalidation = await cache.invalidate();',
   '  assertEqual(',
-  '    invalidation.generation,',
-  '    generationBefore + 1,',
-  "    '[' + label + '] invalidate() must bump the generation by exactly 1',",
+  '    invalidation.generation === generationBefore,',
+  '    false,',
+  "    '[' + label + '] invalidate() must issue a different generation',",
   '  );',
   '  const generationAfter = await cache.generation();',
   '  assertEqual(',
   '    generationAfter,',
-  '    generationBefore + 1,',
+  '    invalidation.generation,',
   "    '[' + label + '] generation() must reflect the bump made by invalidate()',",
   '  );',
   '',
@@ -115,6 +115,18 @@ const ASSERTIONS_SOURCE = [
   "    '[' + label + '] a write at the current generation must be accepted',",
   '  );',
   '',
+  "  const hit = await cache.getOrComputeResult('widget', loader, { ttlMs: 60000 });",
+  "  assertEqual(hit.source, 'fresh', 'detailed API reports a hit');",
+  "  assertEqual(hit.write, 'not-attempted', 'hits do not write');",
+  "  assertEqual(hit.generation, generationAfter, 'hit includes its verified token');",
+  "  await redis.del('{consumer-test-' + label + '}:v2:gen');",
+  "  assertEqual(await cache.get('widget'), undefined, 'generation loss invalidates surviving entries');",
+  "  const recovered = await cache.getOrComputeResult('widget', loader, { ttlMs: 60000 });",
+  "  assertEqual(recovered.source, 'computed', 'generation loss forces recomputation');",
+  "  assertEqual(recovered.write, 'accepted', 'recovered write is accepted');",
+  "  assertEqual(recovered.generation === generationAfter, false, 'generation is never reset to the old token');",
+  "  assertEqual(await cache.setIfGeneration('widget', 'old', generationBefore, { ttlMs: 60000 }), false, 'old writer stays rejected after metadata loss');",
+  '',
   "  process.stdout.write('[' + label + '] ok\\n');",
   '  } finally {',
   '    await redis.close();',
@@ -142,6 +154,43 @@ runConsumerChecks(createFencedCache, 'cjs').catch((error) => {
   process.exitCode = 1;
 });
 `;
+
+const TYPES_TEST_SOURCE = `import {
+  createFencedCache,
+  type FencedCacheResult,
+  type GenerationToken,
+  type RedisCommands,
+} from 'cache-fence';
+
+export async function consume(redis: RedisCommands): Promise<FencedCacheResult<string>> {
+  const cache = createFencedCache({ redis, namespace: 'typed-consumer' });
+  const generation: GenerationToken = await cache.generation();
+  const rotated: GenerationToken = await cache.bumpGeneration();
+  const accepted: boolean = await cache.setIfGeneration('key', 'value', generation, { ttlMs: 1000 });
+  const value: string = await cache.getOrCompute('key', async () => 'value', { ttlMs: 1000 });
+  const result = await cache.getOrComputeResult('key', async () => value, { ttlMs: 1000 });
+  if (result.source === 'fresh' || result.source === 'stale') {
+    const verified: GenerationToken = result.generation;
+    const write: 'not-attempted' = result.write;
+    void verified;
+    void write;
+  }
+  void rotated;
+  void accepted;
+  return result;
+}
+`;
+
+function checkTypes(consumerDir) {
+  const files = ['consumer.mts', 'consumer.cts'];
+  for (const file of files) writeFileSync(join(consumerDir, file), TYPES_TEST_SOURCE);
+  log('checking the installed ESM and CJS type declarations...');
+  run(
+    join(repoRoot, 'node_modules', '.bin', 'tsc'),
+    ['--noEmit', '--strict', '--target', 'ES2022', '--module', 'NodeNext', ...files],
+    { cwd: consumerDir },
+  );
+}
 
 function run(command, args, options) {
   return execFileSync(command, args, {
@@ -201,6 +250,7 @@ async function main() {
   try {
     const tarballPath = packTarball(packDir);
     installTarball(consumerDir, tarballPath);
+    checkTypes(consumerDir);
     runCheck(consumerDir, 'esm-test.mjs', ESM_TEST_SOURCE, redisUrl);
     runCheck(consumerDir, 'cjs-test.cjs', CJS_TEST_SOURCE, redisUrl);
     log('all consumer checks passed.');

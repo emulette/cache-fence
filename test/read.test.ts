@@ -1,5 +1,10 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { createFencedCache, type FencedCacheErrorEvent, type RedisCommands } from '../src/index';
+import {
+  createFencedCache,
+  FENCED_CACHE_ERRORS,
+  type FencedCacheErrorEvent,
+  type RedisCommands,
+} from '../src/index';
 import { startRedisFixture, storageKeys, type RedisFixture } from './redis-fixture';
 
 describe('atomic cache reads', () => {
@@ -15,21 +20,69 @@ describe('atomic cache reads', () => {
     await fx.flush();
   });
 
+  it('starts with an isolated cold cache when legacy counters and entries exist', async () => {
+    await fx.raw.set('{upgrade}:gen', '7');
+    await fx.raw.set('{upgrade}:k:f:item', '"legacy"', { PX: 60_000 });
+    const cache = createFencedCache({ redis: fx.commands, namespace: 'upgrade' });
+    expect(await cache.get('item')).toBeUndefined();
+    expect(await cache.getOrCompute('item', async () => 'current', { ttlMs: 60_000 })).toBe(
+      'current',
+    );
+    await cache.invalidate();
+    expect(await cache.get('item')).toBeUndefined();
+    expect(await fx.raw.get('{upgrade}:k:f:item')).toBe('"legacy"');
+    expect(await fx.raw.get('{upgrade}:gen')).toBe('7');
+  });
+
+  it.each(['0', 'not-a-token'])(
+    'fails closed for corrupted generation %s even when an entry matches it',
+    async (raw) => {
+      const errors: FencedCacheErrorEvent[] = [];
+      const cache = createFencedCache({
+        redis: fx.commands,
+        namespace: 'corrupt',
+        onError: (event) => errors.push(event),
+      });
+      await fx.raw.set(storageKeys.counter('corrupt'), raw);
+      await fx.raw.set(storageKeys.fresh('corrupt', 'item'), `${raw}\n"unverified"`);
+      await expect(cache.generation()).rejects.toThrow(FENCED_CACHE_ERRORS.invalidGeneration(raw));
+      await expect(cache.get('item')).rejects.toThrow(FENCED_CACHE_ERRORS.invalidGeneration(raw));
+      expect(
+        await cache.getOrComputeResult('item', async () => 'computed', { ttlMs: 60_000 }),
+      ).toEqual({
+        value: 'computed',
+        source: 'computed',
+        generation: null,
+        write: 'skipped',
+      });
+      expect(errors[0]?.operation).toBe('generation');
+      await cache.bumpGeneration();
+      expect(await cache.getOrCompute('item', async () => 'recovered', { ttlMs: 60_000 })).toBe(
+        'recovered',
+      );
+    },
+  );
+
+  it('treats unstamped data as a miss instead of passing it to the serializer', async () => {
+    const cache = createFencedCache({ redis: fx.commands, namespace: 'unstamped' });
+    await fx.raw.set(storageKeys.fresh('unstamped', 'item'), '"raw"');
+    expect(await cache.get('item')).toBeUndefined();
+    expect(await cache.getOrCompute('item', async () => 'verified', { ttlMs: 60_000 })).toBe(
+      'verified',
+    );
+  });
+
   it('serves a fresh hit with one Redis round trip', async () => {
     let commands = 0;
     const redis: RedisCommands = {
       ...fx.commands,
-      get: (key) => {
-        commands += 1;
-        return fx.commands.get(key);
-      },
       eval: (script, options) => {
         commands += 1;
         return fx.commands.eval(script, options);
       },
     };
     const cache = createFencedCache({ redis, namespace: 'read' });
-    await cache.setIfGeneration('item', null, 0, { ttlMs: 60_000 });
+    await cache.setIfGeneration('item', null, await cache.generation(), { ttlMs: 60_000 });
     commands = 0;
     let loads = 0;
 
@@ -58,12 +111,8 @@ describe('atomic cache reads', () => {
       const errors: FencedCacheErrorEvent[] = [];
       const redis: RedisCommands = {
         ...fx.commands,
-        get: (key) => {
-          reads += 1;
-          return fx.commands.get(key);
-        },
         eval: (script, options) => {
-          if (options.arguments.length === 0) {
+          if (options.arguments.length === 1) {
             reads += 1;
           }
           return fx.commands.eval(script, options);
@@ -86,7 +135,9 @@ describe('atomic cache reads', () => {
         expect(await fx.raw.lRange(storageKey, 0, -1)).toEqual(['not-a-cache-string']);
       } else {
         expect(await cache.get('item')).toBe('computed');
-        expect(await fx.raw.get(storageKey)).toBe(JSON.stringify('computed'));
+        expect(await fx.raw.get(storageKey)).toBe(
+          `${await cache.generation()}\n${JSON.stringify('computed')}`,
+        );
       }
     },
   );

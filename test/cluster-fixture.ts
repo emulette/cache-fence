@@ -6,7 +6,7 @@ import { poll } from './redis-fixture';
 
 /**
  * A real Redis Cluster the host can actually talk to, plus the cluster adapter for
- * the library's five-operation {@link RedisCommands} surface.
+ * the library's two-operation {@link RedisCommands} surface.
  *
  * ## Why one container runs every node
  *
@@ -48,7 +48,7 @@ function createRawCluster(rootNodes: Array<{ url: string }>) {
 export type RawRedisCluster = ReturnType<typeof createRawCluster>;
 
 export interface ClusterFixture {
-  /** The five-operation adapter the library is constructed with. */
+  /** The two-operation adapter the library is constructed with. */
   commands: RedisCommands;
   cluster: RawRedisCluster;
   /** `host:port` of every master, in the client's topology order. */
@@ -202,18 +202,12 @@ export async function startClusterFixture(): Promise<ClusterFixture> {
   /**
    * The adapter. Only `scanIterator` needs cluster-specific work:
    *
-   * - `eval` is routed by its first key, and the library's two keys share the
-   *   `{namespace}` hash tag, so both live on the node it is routed to;
-   * - `unlink` receives keys from one namespace, so they share a slot and the
-   *   multi-key command stays inside one node;
-   * - `get` and `incr` are single-key and route themselves.
+   * `eval` routes by its first key. Generation, entry and cleanup keys share the
+   * `{namespace}` hash tag, so each script stays within one slot.
    */
   const commands: RedisCommands = {
-    get: (key) => cluster.get(key),
-    incr: (key) => cluster.incr(key),
     eval: (script, options) => cluster.eval(script, options),
     scanIterator: (options) => scanAllMasters(cluster, options),
-    unlink: (keys) => cluster.unlink(keys),
   };
 
   const keySlot = async (key: string): Promise<number> => {

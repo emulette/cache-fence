@@ -12,7 +12,7 @@ function createRawClient(url: string) {
 export type RawRedisClient = ReturnType<typeof createRawClient>;
 
 export interface RedisFixture {
-  /** The five-operation adapter the library is constructed with. */
+  /** The two-operation adapter the library is constructed with. */
   commands: RedisCommands;
   raw: RawRedisClient;
   flush(): Promise<void>;
@@ -26,11 +26,8 @@ export async function startRedisFixture(): Promise<RedisFixture> {
   await client.connect();
 
   const commands: RedisCommands = {
-    get: (key) => client.get(key),
-    incr: (key) => client.incr(key),
     eval: (script, options) => client.eval(script, options),
     scanIterator: (options) => client.scanIterator(options),
-    unlink: (keys) => client.unlink(keys),
   };
 
   return {
@@ -54,9 +51,9 @@ export async function startRedisFixture(): Promise<RedisFixture> {
  * Everything else goes through the public API.
  */
 export const storageKeys = {
-  counter: (namespace: string): string => `{${namespace}}:gen`,
-  fresh: (namespace: string, key: string): string => `{${namespace}}:k:f:${key}`,
-  stale: (namespace: string, key: string): string => `{${namespace}}:k:s:${key}`,
+  counter: (namespace: string): string => `{${namespace}}:v2:gen`,
+  fresh: (namespace: string, key: string): string => `{${namespace}}:v2:k:f:${key}`,
+  stale: (namespace: string, key: string): string => `{${namespace}}:v2:k:s:${key}`,
 };
 
 /** A promise plus its resolver, used as a gate to hold a computation open. */

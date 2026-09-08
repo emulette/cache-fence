@@ -2,7 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createFencedCache, type FencedCache } from '../src/index';
 import { startRedisFixture, type RedisFixture } from './redis-fixture';
 
-describe('generation counter under concurrency', () => {
+describe('generation token under concurrency', () => {
   let fx: RedisFixture;
   let cache: FencedCache;
 
@@ -22,10 +22,15 @@ describe('generation counter under concurrency', () => {
   it('hands every one of 50 concurrent invalidators a distinct generation', async () => {
     const results = await Promise.all(Array.from({ length: 50 }, () => cache.bumpGeneration()));
 
-    // A lost update would show up as a duplicate return value or a counter below 50.
+    // Every invalidator rotates; the final token must be one of those returned.
     expect(new Set(results).size).toBe(50);
-    expect(Math.max(...results)).toBe(50);
-    expect(await cache.generation()).toBe(50);
+    expect(results).toContain(await cache.generation());
+  });
+
+  it('initializes one shared token for concurrent readers of an empty namespace', async () => {
+    const results = await Promise.all(Array.from({ length: 50 }, () => cache.generation()));
+    expect(new Set(results).size).toBe(1);
+    expect(await cache.generation()).toBe(results[0]);
   });
 
   it('rejects every writer that captured a pre-invalidation generation and accepts every one after it', async () => {

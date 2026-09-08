@@ -24,7 +24,7 @@ function countEvals(base: RedisCommands): {
       ...base,
       eval: async (script, options) => {
         const reply = await base.eval(script, options);
-        if (options.arguments.length > 0) {
+        if (options.arguments.length === 3) {
           completed += 1;
         }
         return reply;

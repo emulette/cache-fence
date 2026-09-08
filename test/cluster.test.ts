@@ -65,13 +65,14 @@ describe.skipIf(process.env.CLUSTER_TESTS !== '1')('redis cluster', () => {
     });
 
     it('runs the fenced write through the cluster without a CROSSSLOT error', async () => {
-      expect(await cache.generation()).toBe(0);
-      expect(await cache.setIfGeneration('works', 'v1', 0, { ttlMs: TTL_MS })).toBe(true);
+      const before = await cache.generation();
+      expect(await cache.setIfGeneration('works', 'v1', before, { ttlMs: TTL_MS })).toBe(true);
       expect(await cache.get<string>('works')).toBe('v1');
 
-      expect(await cache.bumpGeneration()).toBe(1);
-      expect(await cache.generation()).toBe(1);
-      expect(await cache.setIfGeneration('works', 'v2', 1, { ttlMs: TTL_MS })).toBe(true);
+      const after = await cache.bumpGeneration();
+      expect(after).not.toBe(before);
+      expect(await cache.generation()).toBe(after);
+      expect(await cache.setIfGeneration('works', 'v2', after, { ttlMs: TTL_MS })).toBe(true);
       expect(await cache.get<string>('works')).toBe('v2');
     });
 
@@ -81,12 +82,8 @@ describe.skipIf(process.env.CLUSTER_TESTS !== '1')('redis cluster', () => {
         namespace: 'catalog',
         redis: {
           ...fx.commands,
-          get: (key) => {
-            reads += 1;
-            return fx.commands.get(key);
-          },
           eval: (script, options) => {
-            if (options.arguments.length === 0) {
+            if (options.arguments.length === 1) {
               reads += 1;
             }
             return fx.commands.eval(script, options);
@@ -94,6 +91,7 @@ describe.skipIf(process.env.CLUSTER_TESTS !== '1')('redis cluster', () => {
         },
       });
       const options = { ttlMs: TTL_MS, staleTtlMs: TTL_MS * 2 };
+      const generation = await cache.generation();
       await cache.getOrCompute('works', async () => 'v1', options);
       reads = 0;
       expect(await cache.getOrCompute('works', async () => 'unexpected', options)).toBe('v1');
@@ -117,7 +115,8 @@ describe.skipIf(process.env.CLUSTER_TESTS !== '1')('redis cluster', () => {
       } finally {
         gate.resolve();
         await poll(
-          async () => (await fx.cluster.get(storageKeys.stale('catalog', 'works'))) === '"v2"',
+          async () =>
+            (await fx.cluster.get(storageKeys.stale('catalog', 'works'))) === `${generation}\n"v2"`,
         );
       }
       expect(await cache.get('works')).toBe('v2');
@@ -127,7 +126,7 @@ describe.skipIf(process.env.CLUSTER_TESTS !== '1')('redis cluster', () => {
       const generationAtStart = await cache.generation();
       const result = await cache.invalidate();
 
-      expect(result.generation).toBe(generationAtStart + 1);
+      expect(result.generation).not.toBe(generationAtStart);
       expect(
         await cache.setIfGeneration('works', 'stale', generationAtStart, { ttlMs: TTL_MS }),
       ).toBe(false);
@@ -185,37 +184,72 @@ describe.skipIf(process.env.CLUSTER_TESTS !== '1')('redis cluster', () => {
       const untouched = namespaces.filter((_unused, index) => index !== sweptIndex);
 
       const cache = createFencedCache({ redis: fx.commands, namespace: swept });
+      const generation = await cache.generation();
       await Promise.all(
         Array.from({ length: SWEEP_KEY_COUNT }, (_unused, index) =>
-          cache.setIfGeneration(`item:${index}`, index, 0, { ttlMs: TTL_MS }),
+          cache.setIfGeneration(`item:${index}`, index, generation, { ttlMs: TTL_MS }),
         ),
       );
       const neighbours = untouched.map((namespace) =>
         createFencedCache({ redis: fx.commands, namespace }),
       );
       await Promise.all(
-        neighbours.map((neighbour) =>
-          neighbour.setIfGeneration('kept', 'v1', 0, { ttlMs: TTL_MS }),
+        neighbours.map(async (neighbour) =>
+          neighbour.setIfGeneration('kept', 'v1', await neighbour.generation(), { ttlMs: TTL_MS }),
         ),
       );
 
+      const neighbourGenerations = await Promise.all(
+        neighbours.map((neighbour) => neighbour.generation()),
+      );
       const result = await cache.invalidate();
 
       expect(result.deletedKeys).toBe(SWEEP_KEY_COUNT);
       expect(await cache.get('item:0')).toBeUndefined();
       expect(await cache.get(`item:${SWEEP_KEY_COUNT - 1}`)).toBeUndefined();
       // The counter sits outside the swept prefix, so the fence survives its own invalidation.
-      expect(result.generation).toBe(1);
-      expect(await cache.generation()).toBe(1);
+      expect(result.generation).not.toBe(generation);
+      expect(await cache.generation()).toBe(result.generation);
       // Other namespaces are scanned too, but MATCH keeps the sweep to its own keys.
       for (const neighbour of neighbours) {
         expect(await neighbour.get<string>('kept')).toBe('v1');
-        expect(await neighbour.generation()).toBe(0);
+        expect(neighbourGenerations).toContain(await neighbour.generation());
       }
     });
   });
 
   describe('invalidation-crossing write', () => {
+    it('recovers from generation loss and preserves new writes during cleanup on the cluster', async () => {
+      const namespace = 'catalog';
+      const writer = createFencedCache({ redis: fx.commands, namespace });
+      const before = await writer.generation();
+      await writer.setIfGeneration('item', 'old', before, { ttlMs: TTL_MS });
+      await fx.cluster.del(storageKeys.counter(namespace));
+      expect(await writer.get('item')).toBeUndefined();
+      expect(await writer.setIfGeneration('item', 'old', before, { ttlMs: TTL_MS })).toBe(false);
+      let replaced = false;
+      const invalidator = createFencedCache({
+        namespace,
+        redis: {
+          ...fx.commands,
+          scanIterator: async function* (options) {
+            for await (const batch of fx.commands.scanIterator(options)) {
+              if (!replaced) {
+                await writer.setIfGeneration('item', 'new', await writer.generation(), {
+                  ttlMs: TTL_MS,
+                });
+                replaced = true;
+              }
+              yield batch;
+            }
+          },
+        },
+      });
+      await invalidator.invalidate();
+      expect(replaced).toBe(true);
+      expect(await writer.get('item')).toBe('new');
+    });
+
     it('drops the write-back of a computation an invalidation overtook', async () => {
       const cache = createFencedCache({ redis: fx.commands, namespace: 'catalog' });
       const started = deferred();

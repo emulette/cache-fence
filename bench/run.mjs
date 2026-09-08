@@ -43,12 +43,6 @@ const PAYLOAD = {
 };
 const PAYLOAD_BYTES = Buffer.byteLength(JSON.stringify(PAYLOAD));
 
-/**
- * Mirrors the library's internal key layout, so the raw-GET baseline reads
- * exactly the key getOrCompute reads.
- */
-const freshStorageKey = (namespace, key) => `{${namespace}}:k:f:${key}`;
-
 async function loadLibrary() {
   const dist = new URL('../dist/index.mjs', import.meta.url);
   if (!existsSync(dist)) {
@@ -169,7 +163,7 @@ const DELTA_LEGEND =
 /**
  * 1. Fenced write vs plain SET.
  *
- * setIfGeneration is one EVAL round trip doing a counter GET plus a conditional
+ * setIfGeneration is one EVAL round trip doing a generation GET plus a conditional
  * SET; the baseline is a raw `SET key value PX ttl` of the same serialized value
  * on the same connection. The baseline serializes per call too, so the delta is
  * the fence, not JSON.
@@ -233,7 +227,8 @@ async function benchReadHit({ createFencedCache, commands, client }) {
   }
   loaderCalls = 0;
 
-  const storageKey = freshStorageKey(NS_READ, HOT_KEY);
+  const storageKey = 'bench-read:unfenced:hot';
+  await client.set(storageKey, JSON.stringify(PAYLOAD), { PX: TTL_MS });
   const { a: hit, b: raw } = await measurePair({
     warmup: READ_WARMUP,
     ops: READ_OPS,
@@ -284,8 +279,8 @@ async function populate(cache, generation) {
 /**
  * 3. Invalidation sweep cost.
  *
- * One invalidate() over a namespace holding SWEEP_KEYS keys: INCR, then a SCAN
- * of the keyspace unlinking matches in batches. Setup writes are pipelined via
+ * One invalidate() over a namespace holding SWEEP_KEYS keys: rotate the token, then SCAN
+ * and atomically unlink obsolete entries in batches. Setup writes are pipelined via
  * Promise.all chunks and are not part of the measurement.
  */
 async function benchInvalidate({ createFencedCache, commands, client }) {
@@ -355,11 +350,8 @@ async function main() {
   await client.connect();
 
   const commands = {
-    get: (key) => client.get(key),
-    incr: (key) => client.incr(key),
     eval: (script, options) => client.eval(script, options),
     scanIterator: (options) => client.scanIterator(options),
-    unlink: (keys) => client.unlink(keys),
   };
   const context = { createFencedCache, commands, client };
 
