@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-01
+
+### Added
+
+- CI runs the standalone and Cluster suites against Redis 7 and 8 and Valkey 8 and 9,
+  each through both node-redis and ioredis. `REDIS_IMAGE` and `REDIS_CLIENT` select the
+  combination locally; `bench/run.mjs` also honors `REDIS_IMAGE`.
+- The README ioredis adapter is now tested verbatim (ioredis 6.x), and the Cluster
+  fixture includes an ioredis adapter that scans every master.
+
+### Changed
+
+- Update development dependencies; `npm audit` reports no vulnerabilities. The
+  runtime code is unchanged from 0.2.0.
+
 ## [0.2.0] - 2026-09-08
 
 ### Breaking changes

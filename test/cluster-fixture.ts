@@ -1,8 +1,9 @@
 import { createServer } from 'node:net';
+import { Cluster } from 'ioredis';
 import { createClient, createCluster } from 'redis';
 import { GenericContainer, Wait } from 'testcontainers';
 import type { RedisCommands } from '../src/index';
-import { poll } from './redis-fixture';
+import { poll, REDIS_CLIENT, REDIS_IMAGE } from './redis-fixture';
 
 /**
  * A real Redis Cluster the host can actually talk to, plus the cluster adapter for
@@ -26,7 +27,6 @@ import { poll } from './redis-fixture';
  * ports are bound explicitly instead of being mapped to random host ports.
  */
 
-const REDIS_IMAGE = 'redis:7-alpine';
 const MASTER_COUNT = 3;
 const PORT_SEARCH_START = 7301;
 const PORT_SEARCH_END = 7399;
@@ -171,6 +171,18 @@ async function* scanAllMasters(
   }
 }
 
+/** The ioredis form of {@link scanAllMasters}: `Cluster#scanStream` does not exist, nodes do. */
+async function* scanAllIoredisMasters(
+  cluster: Cluster,
+  { MATCH, COUNT }: { MATCH: string; COUNT: number },
+): AsyncGenerator<string[]> {
+  for (const node of cluster.nodes('master')) {
+    for await (const keys of node.scanStream({ match: MATCH, count: COUNT })) {
+      yield keys;
+    }
+  }
+}
+
 /** Boots a throwaway three-master cluster and wires a client to it. One per test file. */
 export async function startClusterFixture(): Promise<ClusterFixture> {
   const ports = await findFreePorts(MASTER_COUNT);
@@ -205,10 +217,32 @@ export async function startClusterFixture(): Promise<ClusterFixture> {
    * `eval` routes by its first key. Generation, entry and cleanup keys share the
    * `{namespace}` hash tag, so each script stays within one slot.
    */
-  const commands: RedisCommands = {
-    eval: (script, options) => cluster.eval(script, options),
-    scanIterator: (options) => scanAllMasters(cluster, options),
-  };
+  const io =
+    REDIS_CLIENT === 'ioredis'
+      ? new Cluster(
+          ports.map((port) => ({ host: ANNOUNCE_HOST, port })),
+          { lazyConnect: true },
+        )
+      : undefined;
+  await io?.connect();
+  if (io && io.nodes('master').length !== MASTER_COUNT) {
+    io.disconnect();
+    await cluster.close();
+    await container.stop();
+    throw new Error(
+      `expected ${MASTER_COUNT} masters, ioredis discovered ${io.nodes('master').length}`,
+    );
+  }
+
+  const commands: RedisCommands = io
+    ? {
+        eval: (script, { keys, arguments: args }) => io.eval(script, keys.length, ...keys, ...args),
+        scanIterator: (options) => scanAllIoredisMasters(io, options),
+      }
+    : {
+        eval: (script, options) => cluster.eval(script, options),
+        scanIterator: (options) => scanAllMasters(cluster, options),
+      };
 
   const keySlot = async (key: string): Promise<number> => {
     const client = await cluster.nodeClient(cluster.masters[0]);
@@ -231,6 +265,7 @@ export async function startClusterFixture(): Promise<ClusterFixture> {
       }
     },
     stop: async () => {
+      io?.disconnect();
       await cluster.close();
       await container.stop();
     },

@@ -1,6 +1,31 @@
 import { RedisContainer } from '@testcontainers/redis';
+import { Redis } from 'ioredis';
 import { createClient } from 'redis';
 import type { RedisCommands } from '../src/index';
+
+/** Server image under test. CI runs the suite once per supported Redis and Valkey image. */
+export const REDIS_IMAGE = process.env.REDIS_IMAGE ?? 'redis:7-alpine';
+
+const REDIS_CLIENTS = ['node-redis', 'ioredis'] as const;
+type RedisClientName = (typeof REDIS_CLIENTS)[number];
+
+function isRedisClientName(value: string): value is RedisClientName {
+  return (REDIS_CLIENTS as readonly string[]).includes(value);
+}
+
+/**
+ * Client library behind the adapter the cache is constructed with.
+ *
+ * Only the library's two operations switch clients; raw inspection always uses node-redis,
+ * so every scenario asserts the same Redis state whichever client produced it.
+ */
+export const REDIS_CLIENT: RedisClientName = (() => {
+  const value = process.env.REDIS_CLIENT ?? 'node-redis';
+  if (!isRedisClientName(value)) {
+    throw new Error(`REDIS_CLIENT must be one of ${REDIS_CLIENTS.join(', ')}, got ${value}`);
+  }
+  return value;
+})();
 
 // The return type is left inferred on purpose: node-redis resolves the client type
 // from the options it was called with, and spelling it out here would not match.
@@ -21,14 +46,21 @@ export interface RedisFixture {
 
 /** Boots a throwaway Redis container and wires a client to it. One per test file. */
 export async function startRedisFixture(): Promise<RedisFixture> {
-  const container = await new RedisContainer('redis:7-alpine').start();
+  const container = await new RedisContainer(REDIS_IMAGE).start();
   const client = createRawClient(container.getConnectionUrl());
   await client.connect();
 
-  const commands: RedisCommands = {
-    eval: (script, options) => client.eval(script, options),
-    scanIterator: (options) => client.scanIterator(options),
-  };
+  const io = REDIS_CLIENT === 'ioredis' ? new Redis(container.getConnectionUrl()) : undefined;
+  const commands: RedisCommands = io
+    ? // The README's ioredis adapter, verbatim.
+      {
+        eval: (script, { keys, arguments: args }) => io.eval(script, keys.length, ...keys, ...args),
+        scanIterator: ({ MATCH, COUNT }) => io.scanStream({ match: MATCH, count: COUNT }),
+      }
+    : {
+        eval: (script, options) => client.eval(script, options),
+        scanIterator: (options) => client.scanIterator(options),
+      };
 
   return {
     commands,
@@ -37,6 +69,7 @@ export async function startRedisFixture(): Promise<RedisFixture> {
       await client.flushAll();
     },
     stop: async () => {
+      io?.disconnect();
       await client.close();
       await container.stop();
     },

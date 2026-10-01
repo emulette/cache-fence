@@ -1,6 +1,6 @@
 {
   "name": "cache-fence",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Generation-fenced Redis cache: atomically rejects stale writes that cross an invalidation",
   "license": "MIT OR Apache-2.0",
   "type": "module",
@@ -67,14 +67,15 @@
     "url": "https://github.com/emulette/cache-fence/issues"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.5.14",
-    "@testcontainers/redis": "^12.1.0",
+    "@biomejs/biome": "^2.5.15",
+    "@testcontainers/redis": "^12.2.0",
     "@types/node": "^26.6.3",
-    "redis": "^6.2.1",
-    "testcontainers": "^12.1.0",
+    "ioredis": "^6.0.0",
+    "redis": "^6.3.0",
+    "testcontainers": "^12.2.0",
     "tsdown": "^0.23.0",
     "typescript": "^7.0.2",
-    "vite": "^8.3.1",
-    "vitest": "^5.0.2"
+    "vite": "^8.3.2",
+    "vitest": "^5.0.3"
   }
 }

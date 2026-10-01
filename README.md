@@ -13,7 +13,8 @@ npm install cache-fence redis
 ```
 
 Node.js >= 22. `redis` (node-redis) `>=5.0.0 <7` is an optional peer dependency.
-The test suite runs against Redis 7 in isolated Docker containers, including a three-master Redis Cluster.
+The test suite runs against Redis 7 and 8 and Valkey 8 and 9 in isolated Docker containers, standalone and as a
+three-master Cluster, through both node-redis and ioredis.
 
 **Upgrading from 0.1.x:** 0.2.0 changes generation types and Redis storage. Read [Migration](#migration-from-01x)
 before deploying readers or invalidators.
@@ -220,7 +221,7 @@ export interface RedisCommands {
 }
 ```
 
-Pass a standalone node-redis client directly. An illustrative ioredis adapter:
+Pass a standalone node-redis client directly. For ioredis (tested with 6.x), use this adapter:
 
 ```ts
 const adapter: RedisCommands = {
@@ -235,8 +236,8 @@ all keys in the chosen namespaces. Configure connection deadlines and reconnecti
 
 For Redis Cluster, every key a script touches shares the `{namespace}` hash tag. EVAL routes by its first
 key. SCAN cursors belong to individual nodes: the adapter must visit every primary or target the primary
-owning the namespace. [test/cluster-fixture.ts](test/cluster-fixture.ts) contains a complete adapter that walks
-all masters. An incomplete scan leaks obsolete entries until their TTL expires, but verified reads still
+owning the namespace. [test/cluster-fixture.ts](test/cluster-fixture.ts) contains complete node-redis and ioredis
+adapters that walk all masters; with ioredis, iterate `cluster.nodes('master')` and call each node's `scanStream`. An incomplete scan leaks obsolete entries until their TTL expires, but verified reads still
 reject them after generation rotation.
 
 ## Migration from 0.1.x
@@ -294,6 +295,15 @@ node bench/run.mjs
 The tests reproduce an unfenced resurrection and exercise real Redis fencing, metadata loss/eviction,
 failed cleanup, concurrent replacement, SWR, serialization, per-call results and Cluster slot routing.
 Consumer checks install a packed tarball and run both ESM and CJS entry points against Redis.
+
+The server image and the client behind the adapter are selected per run. CI covers every combination:
+
+```sh
+REDIS_IMAGE=valkey/valkey:9-alpine REDIS_CLIENT=ioredis npm test
+REDIS_IMAGE=redis:8-alpine REDIS_CLIENT=ioredis npm run test:cluster
+```
+
+`REDIS_IMAGE` defaults to `redis:7-alpine`; `REDIS_CLIENT` is `node-redis` (default) or `ioredis`.
 
 A local 0.2.0 run on 2026-09-08 (Apple M4 Pro, Node 26.5.0, Redis 7.4.10 in Docker) measured:
 

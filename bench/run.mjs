@@ -3,10 +3,10 @@
  * cache-fence benchmark suite.
  *
  * Measures what fencing costs against the unfenced Redis primitives it replaces,
- * on a throwaway redis:7-alpine container. Absolute numbers are dominated by
+ * on a throwaway Redis container (REDIS_IMAGE, default redis:7-alpine). Absolute numbers are dominated by
  * loopback RTT and vary by machine; the ratios are the signal.
  *
- * Usage: node bench/run.mjs   (requires Docker; builds dist/ if missing)
+ * Usage: [REDIS_IMAGE=redis:8-alpine] node bench/run.mjs   (requires Docker; builds dist/ if missing)
  */
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
@@ -14,7 +14,7 @@ import os from 'node:os';
 import { RedisContainer } from '@testcontainers/redis';
 import { createClient } from 'redis';
 
-const REDIS_IMAGE = 'redis:7-alpine';
+const REDIS_IMAGE = process.env.REDIS_IMAGE ?? 'redis:7-alpine';
 
 /** Workload sizes are fixed so runs are comparable across machines. */
 const WRITE_OPS = 5_000;

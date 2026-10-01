@@ -4,7 +4,7 @@ Fencing is not free. These benchmarks put a number on it, so the trade-off can b
 argued with data instead of adjectives: **what does the correctness guarantee cost
 against the unfenced Redis primitives it replaces?**
 
-Everything runs against a throwaway `redis:7-alpine` container started by
+Everything runs against a throwaway Redis container (`redis:7-alpine` by default) started by
 testcontainers. No new dependencies: `node:perf_hooks`-grade timing via
 `process.hrtime.bigint()`, the `redis` and `@testcontainers/redis` devDependencies
 the test suite already uses, and no test framework.
@@ -18,6 +18,9 @@ npm install
 npm run build
 node bench/run.mjs
 ```
+
+Set `REDIS_IMAGE` (for example `redis:8-alpine` or `valkey/valkey:9-alpine`) to
+benchmark another server image; the default is `redis:7-alpine`.
 
 The script builds `dist/` with `npm run build` if it is missing, boots the
 container, prints one markdown table per benchmark, and tears the container down.

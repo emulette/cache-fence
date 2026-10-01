@@ -41,8 +41,21 @@ jobs:
       - name: Test
         run: npm test
 
-  cluster:
+  # Every supported server image and client library, standalone and Cluster.
+  compatibility:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        redis-image:
+          - redis:7-alpine
+          - redis:8-alpine
+          - valkey/valkey:8-alpine
+          - valkey/valkey:9-alpine
+        redis-client: [node-redis, ioredis]
+    env:
+      REDIS_IMAGE: ${{ matrix.redis-image }}
+      REDIS_CLIENT: ${{ matrix.redis-client }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -54,6 +67,9 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Standalone tests
+        run: npm test
 
       - name: Cluster tests
         run: npm run test:cluster
